@@ -1,0 +1,1243 @@
+#!/usr/bin/env python3
+"""Apply the widescreen gen-code patch layer for MMX (marker-injected,
+restorable — same discipline as SMW's tools/apply_overrides.py).
+
+Runs AFTER regen, BEFORE compilation. Injection is marked and idempotent;
+--restore strips every marked line, returning gen to pristine output for
+the standard (authentic) zip.
+
+History: a first revision biased the committed camera snapshot (DP $22 of
+the D=$1E48 scroll page) at the $00DE19/$00DE40 stores ("WS-LOOKAHEAD").
+That FROZE the camera: bank_00_DC36 (and likely other consumers) diff the
+committed snapshot against the live camera ($1E4D) to detect 32px column
+crossings — a permanent bias wedges the scroll state machine. Lesson: the
+$05->$22 copy is a prev/cur camera pair, not a one-way streaming input.
+Widening now happens at the CONSUMER comparisons instead:
+
+WS-CULL — widen the offscreen despawn window (X axis only).
+  bank_02_806E is the single scroll-off cull check (JSL'd from every
+  enemy epilogue): cull when (objX - $1E4D + 0x40) >= 0x180, i.e. keep
+  window = camera -64..+320. The snippet recomputes the carry verdict
+  through MmxWsCullVerdictX (mmx_rtl.c): window widened by the live
+  widescreen margin on both sides; identical to vanilla when off.
+  The Y-axis check (0x40/0x160) is untouched.
+
+WS-PRESENTATION-CULL — widen Highway traffic's horizontal OAM/lifetime gate.
+  bank_82_808F is the kind-1 presentation-object position dispatcher. Its
+  first comparison marks an object absent when
+  (objX - cameraX + 0x60) >= 0x1C0; the Highway car updater then clears an
+  absent object immediately. The hook replaces only that carry verdict via
+  MmxWsPresentationCullVerdictX, whose host-side gate requires Highway stage
+  0 and traffic object ID $21. Other presentation objects and the vertical
+  comparison remain vanilla-identical.
+
+WS-SPAWN — shift the enemy spawn-scan anchor into the margins.
+  bank_00_DC36 fires per 32px camera column crossing and sets the scan
+  anchor $00 for the spawn list-walker (bank_00_DCDB): scrolling right
+  anchor = $1E4D + 0x100 (block $00DC78), scrolling left anchor = $1E4D
+  (block $00DC62). Snippets re-store the anchor through
+  MmxWsSpawnAnchorRight/Left (+margin / -margin, left clamped at 0), passing
+  the active direct page so the host can split the event-list cursor.
+  Each camera-column update runs paired record passes: the normal call scans
+  the widescreen anchor and admits ordinary type-3 enemies plus narrowly
+  identified Highway traffic; a balanced second call scans the native anchor
+  and admits kinds 0-2. The passes have independent event-list cursors: the
+  guest cursor remains native and save-state-authoritative, while a host cursor
+  advances the widened scan. Rejecting a future controller in the wide pass
+  therefore cannot consume it before native timing. Enemy ownership stays
+  strictly disjoint because an enemy can die before native timing. Spark
+  Mandrill's kind-3/id-$03 mid-boss controller is explicitly native-owned.
+  Traffic deliberately remains eligible in both passes; its widened lifetime
+  and the guest live flag keep the later native scan idempotent.
+  Spawn bookkeeping self-heals: spawn sets the per-record flag, cull
+  clears it via slot+$0C, so early spawn + wide cull keep hysteresis.
+  Gated separately (SNESRECOMP_WS_SPAWN, default on) so spawning can
+  fall back to authentic 4:3 if wide spawning misbehaves, per the
+  feature requirements; culling stays wide regardless.
+
+WS-ACTIVATE — move the intro helicopter's entrance gate into the margin.
+  bank_82_B964 starts the helicopter controller when it comes within $80
+  pixels of X, which is the native right-edge presentation point. The hook
+  expands that distance by the live right margin plus 32 pixels for the large
+  sprite footprint, so its real motion and OAM begin beyond the 16:9 edge; it
+  is vanilla-identical when wide spawning is disabled.
+
+WS-OAM — emit enemy sprite tiles throughout the right widescreen margin.
+  bank_00_D76A is the shared metasprite tile writer used by ordinary enemies.
+  Its per-tile X test rejects when (screenX + 16) >= 0x10F, which parks every
+  tile whose left edge reaches the native x=255 boundary.  The hook expands
+  that comparison limit by the live widescreen margin.  D6A7's existing OAM
+  high-table packer then carries screenX bit 8 into the hardware X-high bit,
+  so x=256..margin coordinates remain positive instead of wrapping left.
+
+WS-STAGE — stage the BG tilemap margins before they scroll on screen.
+  Tilemap screen staging during gameplay is fired by level-placed
+  camera-line trigger objects (spawned from the same 5-byte records as
+  enemies): bank_03_FDD3 compares live camera X ($0BA8+5, offset from
+  the $86:E4DC event table) against the trigger's line (obj D+$05).
+  State 0 (bank_03_FDAB) fires on cam < line -> FE05 stages the left
+  region; state 2 (bank_03_FDC0) fires on cam >= line -> FE0C stages
+  the right region (both post a region nibble to $1F08 and schedule
+  Task_B091 via B071/B075). The snippet re-biases the compared line
+  through MmxWsStageLineAdjust (mmx_rtl.c): shifted into the camera's
+  travel direction by the margin, X-axis staging watchers only
+  (offset 5, event code 0x15). Direction-aware single line keeps the
+  two fire conditions complementary -> no fire oscillation. Only the
+  M0 variants carry the real 16-bit compare (M1 variants are pruned
+  BRK stubs). Gated by SNESRECOMP_WS_STAGE (default off): renderer-side
+  BG2 prefill now covers first-visit margins without prematurely swapping
+  the guest's shared OBJ graphics at section boundaries.
+
+WS-SHOT-CULL - widen X's projectile lifetime window (X axis only).
+  bank_82_80B4 is the common projectile motion/camera test used by X's
+  weapons: cull when (shotX - $1E4D + 0x20) >= 0x140, i.e. keep window
+  = camera -32..+287. The snippet recomputes the carry verdict through
+  MmxWsShotCullVerdictX, widening both sides by the live margin while
+  remaining equivalent in 4:3. Its Y-axis test is untouched. This routine
+  also sets Zero's visibility during his fortress departure; that scripted
+  exit retains its native boundary so the cutscene can finish before a wall.
+
+WS-CHRBIND - observe (never re-derive) the OAM tile-base bind for the
+  margin-enemy garbled-CHR fix (fix attempt #2). The OAM tile-base/palette bind sequence
+  -- read WRAM $7F:8200+X (tile-base) -> store [D+0x18]; read $7F:8300+X
+  (palette) -> store [D+0x11] -- is INLINED per enemy type across the
+  generated code, not a single shared function: bank_82_827D_M1X1
+  (src/gen/bank82_part00_v2.c:14370-14526) is only ONE of (verified by
+  inspection, 2026-08-06) 8 such inlined copies:
+    bank_82_827D_M1X1  bank82_part00_v2.c
+    bank_82_EDA5_M1X1  bank82_part0d_v2.c
+    bank_82_F554_M1X1  bank82_part0e_v2.c
+    bank_83_F945_M1X1  bank83_part0f_v2.c
+    bank_87_B824_M1X1  bank87_part07_v2.c
+    bank_87_F42A_M1X1  bank87_part0e_v2.c
+    bank_87_F477_M1X1  bank87_part0e_v2.c (stores complete before its
+                        tail-call into bank_84_8F07_M1X1 -- the bind is
+                        NOT split across the call)
+    bank_88_EAA4_M1X1  bank88_part0d_v2.c
+  If the bind fires before the allocator has written that slot for this
+  level section, the object latches a stale/zero tile-base forever (the
+  confirmed root cause of the garbled margin mechs, including the
+  flying-mech family gfx 0x10/0x11/0x12 which binds through one of the
+  non-827D inlined copies above -- never through 827D, which is why the
+  original single-site fix was partial). Fix attempt #1 tried to gate
+  admission on the *value* at the slot and was rejected: zero is a real,
+  legitimate tile-base (page 0), so "not yet written" and "written zero"
+  are indistinguishable from the value alone, and every enemy whose real
+  base is page 0 (or any spawn record whose layout didn't match the
+  transcription) was permanently vetoed from the wide spawn pass, undoing
+  WS-SPAWN's whole point.
+
+  This pass is pattern-based, not per-function-name: it anchors on the
+  tile-base *read* itself (`cpu_read8(cpu, ..., 0x7f8200 + cpu->X, ...)`,
+  emitted identically at every site) and scans forward a bounded window
+  for that same bind's tile-base *store* (`cpu->D + 0x0018`), injecting
+  the host call immediately after the store. Per-site inspection found
+  the sequence is uniform through the tile-base store but NOT beyond it:
+  most sites do a plain palette store, but bank_82_EDA5, bank_83_F945 and
+  bank_87_F42A instead do an ORA-style read-modify-write for the palette
+  half (`_m = read[D+0x11]; write[D+0x11] = _m | A`), merging the table's
+  palette nibble into pre-existing high bits of that byte (other object
+  flags share D+0x11). Because of that, this pass anchors and injects on
+  the tile-base store ONLY -- see MmxWsChrRebindSweep (mmx_rtl.c) for why
+  the host mechanism was correspondingly changed to heal only the
+  tile-base and never replays a raw palette byte.
+
+  Excluded on purpose: bank_87_ABAE_M1X1 (bank87_part05_v2.c) and
+  bank_87_D01D_M1X1 (bank87_part0a_v2.c) each read the $7F:8300 palette
+  table but NEVER $7F:8200 (verified: neither file contains a 0x7f8200
+  read at all) -- they are palette-only refreshers with no tile-base
+  store to latch, so the tile-base-read anchor naturally never matches
+  them; they must not get a latch (nothing to heal, and latching a
+  palette-only refresh would just be dead weight).
+
+  At the injection point cpu->D (the object base) and cpu->X (the game's
+  own VRAM-CHR slot index, used unmodified for the tile-base read) still
+  hold the exact values the game itself used for this bind -- verified
+  per-site that nothing between the anchor and the tile-base store
+  reassigns cpu->X or cpu->D (the pass also checks this live and abandons
+  an anchor if it ever finds otherwise, for regen-drift safety). The host
+  (MmxWsChrBindNote/MmxWsChrRebindSweep, mmx_rtl.c) latches those values
+  plus the slot's WRAM entry at bind time, and once per frame checks
+  whether the allocator has since written a *different* value into that
+  slot; if so, it replays the tile-base store with the new value. This
+  tracks allocation VALIDITY via change-detection instead of the value's
+  zero-ness, so it never misclassifies a legitimate page-0 bind, and it
+  never touches the wide admission path at all (unlike attempt #1), so
+  the WS-SPAWN margin-entry regression it caused cannot recur here.
+
+WS-CHRBIND-COPY - observe the OTHER way an object's tile-base ever gets
+  set: a PLAIN COPY from the currently-executing object's own [D+0x18]
+  into a sibling/child object's [+0x18], indexed by cpu->X (the
+  allocator's returned slot base for the new object -- never re-derived
+  here, same discipline as WS-CHRBIND). This is the 65816 idiom
+  `LDA $18` (direct page) / `STA $0018,X` (absolute indexed in the
+  current data bank), which never touches $7F:8200 at all, so it is
+  invisible to every WS-CHRBIND hook above. If the copying object's own
+  tile-base was itself still the stale/never-written value from the
+  root race (see WS-CHRBIND), the child inherits that stale value
+  PERMANENTLY -- confirmed live 2026-08-06 as the residual garbled
+  flying-mech deploy/spike sub-object, via `bank_87_ECD9_M1X1`
+  (`src/gen/bank87_part0d_v2.c:8548-8554`).
+
+  Anchor: `cpu_read8(cpu, 0x00, (uint16)(cpu->D + 0x0018))`. Because that
+  same expression is also the ordinary "read my own tile-base for
+  whatever reason" idiom used all over the generated code (113 raw
+  occurrences), the anchor alone is not selective enough; the pass
+  additionally verifies the read value is forwarded through the
+  accumulator (`cpu_write_a_m` on the exact anchor variable, immediately
+  next line) and, within a bounded ~12-line window, back out
+  (`cpu_read_a16`) into a `cpu_write8(...)` whose destination contains
+  `0x0018 + (uint32)cpu->X` -- i.e. the generated mirror of `STA
+  $0018,X`. Only that chained shape is injected; a bare read of
+  [D+0x18] that goes anywhere else (there are ~70 of those) is left
+  alone. Like WS-CHRBIND, an anchor is abandoned rather than trusted if
+  cpu->X or cpu->D is reassigned before the chained store completes.
+
+  Scanning all of `src/gen` for this chained shape (2026-08-06) found
+  EXACTLY 42 sites, not the single ECD9 occurrence that motivated the
+  fix -- this "spawn a child, inherit my tile-base by plain copy" idiom
+  recurs throughout the enemy AI across banks 01/81/82/83/87/88 (verified
+  per-site: same accumulator-forwarding shape, no intervening cpu->X/D
+  reassignment, and where cpu->X's own last assignment is visible in the
+  same function -- e.g. `bank_88_D8E3_M1X1`, `bank_88_E2CB_M1X1` -- it is
+  freshly computed from cpu->A just beforehand, i.e. a table-derived
+  slot/object base, the same shape as an allocator handing back a new
+  child's slot; where it is not visible (e.g. ECD9 itself) cpu->X is
+  inherited unmodified from a caller that set it up, exactly as ECD9's
+  own docstring above describes). All 42 are real instances of the same
+  ROM-level operation, not a false-positive cluster, so all 42 get the
+  observability hook -- see EXPECTED_CHRBIND_COPY_SITES below for the
+  full list this was verified against.
+
+  The host (MmxWsChrBindNoteCopy, mmx_rtl.c) does not create a fresh,
+  independent latch: it looks up the most recently active WS-CHRBIND
+  latch whose obj_d equals the COPYING object's D (the parent). If none
+  is active (the parent was never latched, i.e. its own tile-base bind
+  was never suspect, or its latch already retired) the copy is a no-op
+  bookkeeping-wise -- there is nothing to propagate. If the parent does
+  have an active latch, a new latch is created for the CHILD (obj_d =
+  cpu->X, same slot as the parent's, since the child inherited the same
+  VRAM-CHR allocation) so MmxWsChrRebindSweep's existing per-frame heal
+  loop picks it up exactly like any directly-bound object -- no separate
+  sweep or healing path was added; the copy hook only seeds an entry
+  into the SAME ring the direct binds use.
+
+WS-CHRBIND-PARENT - reconcile the residual Highway crusher render child at
+  the authoritative render handoff. bank_00_D6A7_M1X0 copies an object's
+  tile base from `[D+X+$18]` into render scratch `[D+$10]`. Matched F8/F9
+  traces prove the malformed pair's actual objects ($1428/$1468) point to
+  correctly rebound parents ($0E68/$0EA8) in child+$0C, but retain stale
+  child+$18=$00; the healthy control has parent+$18 == child+$18 == $60.
+  Inject immediately after the unique D6A7 byte read and let
+  MmxWsChrBindResolveParent validate Highway stage 0 plus the stable relational
+  crusher signature (aligned child gfx $09 pointing through +$0c to an aligned
+  parent gfx $0f), then return the parent's value for this same render. The
+  parent live byte is not identity: death clears it before the detached
+  crusher child finishes falling, while the relation and retained gfx/base
+  remain authoritative. Child +$14/+16 are also behavior-state pointers, not
+  identity: they change while the crusher descends and extends and therefore
+  must not gate the repair. The resolver deliberately does not mutate guest
+  WRAM. No tile base or object address is hardcoded, and a legitimate page-0
+  allocation remains page 0 when the parent says so.
+
+MSU1-MUSIC - let the host-side MSU-1 plugin own the stock music routine.
+  DarkShock's IPS patch hooks selected call sites and, when a matching PCM
+  exists, plays MSU-1 instead of calling the stock $87B0 music routine. A raw
+  $2140 observer is not selective enough because MMX also streams SPC upload
+  bytes through that port. This hook sits at $87B0 itself: the plugin receives
+  A's music command byte, and when it starts a valid MSU track the generated
+  routine returns before posting SPC music. Missing tracks fall through to the
+  vanilla routine, preserving SPC fallback. Source behavior:
+  https://github.com/mlarouche/MegamanX-MSU1/blob/master/mmx_msu1_music.asm
+
+MSU1-STAGE - mirror DarkShock's level-load hook at $809A2D.
+  Stage BGM reaches the stock music routine through a JMP during level load.
+  Hooking that exact site prevents the SPC stage command from being posted
+  when a matching MSU track exists.
+
+Usage:
+    python tools/apply_overrides.py [--gen-dir src/gen] [--check] [-v]
+    python tools/apply_overrides.py --restore [--gen-dir src/gen] [-v]
+"""
+import argparse
+import glob
+import os
+import re
+import sys
+
+MARKERS = ("/*WS-CULL*/", "/*WS-PRESENTATION-CULL*/", "/*WS-SHOT-CULL*/", "/*WS-SPAWN*/", "/*WS-SPAWN-PASS*/", "/*WS-ACTIVATE*/",
+           "/*WS-FLYER-LEASH*/", "/*WS-ARMOR-CULL*/", "/*WS-STREAKER-WAIT*/",
+           "/*WS-STREAKER-ENTRY*/", "/*WS-CHAIN-PLATFORM*/", "/*WS-BARRIER-ENEMIES*/",
+           "/*WS-OAM*/", "/*WS-OAM-L*/", "/*WS-LOOKAHEAD*/", "/*WS-STAGE*/",
+           "/*WS-SHADOW*/", "/*WS-CHRBIND*/", "/*WS-CHRBIND-COPY*/",
+           "/*WS-CHRBIND-PARENT*/", "/*MSU1-MUSIC*/", "/*MSU1-STAGE*/")
+
+RE_TRACE = re.compile(r"cpu_trace_block\(cpu, (0x[0-9A-Fa-f]+)\)")
+RE_STORE00 = re.compile(
+    r"^(\s*)cpu_write16\(cpu, (0x(?:00|7E)), "
+    r"\(uint16\)\(cpu->D \+ 0x0000\), (_v\d+)\);\s*$")
+RE_CONST180 = re.compile(r"^\s*uint16 (_v\d+) = 0x180;\s*$")
+RE_CONST140 = re.compile(r"^\s*uint16 (_v\d+) = 0x140;\s*$")
+RE_CONST80 = re.compile(r"^(\s*)uint16 (_v\d+) = 0x80;\s*$")
+RE_CONST10F = re.compile(r"^(\s*)uint16 (_v\d+) = 0x10f;\s*$")
+RE_READ_A = re.compile(r"^\s*uint16 (_v\d+) = cpu_read_a16\(cpu\);\s*$")
+RE_BRANCH_C = re.compile(r"^(\s*)if \(cpu->_flag_C == 1\)")
+# The LLE-first emitter keys nodes by the DEMANDED pc24, so a JSL'd body
+# lands under its LoROM execution-mirror bank ($83:FDD3, $82:806E) while
+# short-called bank-00 code keeps its canonical key. Match both: mask bit 7
+# of the bank when comparing block/function PCs.
+RE_FUNC = re.compile(r"^RecompReturn (bank_[08]3_[0-9A-F]+)_M\dX\d\(CpuState")
+
+
+def canon_pc24(pc24):
+    return pc24 & ~0x800000
+RE_CMP_DX = re.compile(
+    r"^(\s*)uint16 (_v\d+) = cpu_read16\(cpu, 0x7E, "
+    r"\(uint16\)\(cpu->D \+ 0x0000 \+ cpu->X\)\);\s*$")
+RE_B23C_ENTRY = re.compile(
+    r"^(\s*)cpu_trace_func_entry\(cpu, 0x[08]0B23C, ")
+
+
+def spawn_snippet(indent, bank, var, which):
+    return (f"{indent}/*WS-SPAWN*/ {{ extern uint16 MmxWsSpawnAnchor{which}"
+            f"(uint16, uint16); cpu_write16(cpu, {bank}, "
+            f"(uint16)(cpu->D + 0x0000), MmxWsSpawnAnchor{which}"
+            f"((uint16)({var}), cpu->D)); }}\n")
+
+
+def cull_snippet(indent, var):
+    return (f"{indent}/*WS-CULL*/ {{ extern uint16 MmxWsCullVerdictX(uint16);"
+            f" cpu->_flag_C = MmxWsCullVerdictX((uint16)({var})); }}\n")
+
+
+def shot_cull_snippet(indent, var):
+    return (f"{indent}/*WS-SHOT-CULL*/ {{ extern uint16 "
+            f"MmxWsShotCullVerdictX(uint16, uint16); cpu->_flag_C = "
+            f"MmxWsShotCullVerdictX(cpu->D, (uint16)({var})); }}\n")
+
+
+def presentation_cull_snippet(indent, var):
+    return (f"{indent}/*WS-PRESENTATION-CULL*/ {{ extern uint16 "
+            f"MmxWsPresentationCullVerdictX(uint16, uint16); "
+            f"cpu->_flag_C = MmxWsPresentationCullVerdictX(cpu->D, "
+            f"(uint16)({var})); }}\n")
+
+
+RE_MSU1_MUSIC_ENTRY = re.compile(
+    r"^RecompReturn bank_(?:00|80)_87B0_M\dX\d\(CpuState \*cpu\) \{\s*$")
+RE_MSU1_MUSIC_ANCHOR = re.compile(
+    r"^(\s*)if \(g_recomp_stack_top >= 1\) "
+    r"g_cpu_entry_s\[g_recomp_stack_top - 1\] = _entry_s;\s*$")
+
+
+def msu1_music_rts_snippet(indent, source_pc, marker):
+    return (
+        f"{indent}{marker} {{ extern int mmx_msu1_music_command(uint8); "
+        f"if (mmx_msu1_music_command((uint8)(cpu->A & 0xff))) {{ "
+        f"uint16 _msu_ret_s = cpu->S; cpu->S = (uint16)(cpu->S + 1); "
+        f"uint16 _msu_rpcl = (uint16)cpu_read8(cpu, 0x00, cpu->S); "
+        f"cpu->S = (uint16)(cpu->S + 1); "
+        f"uint16 _msu_rpch = (uint16)cpu_read8(cpu, 0x00, cpu->S); "
+        f"uint32 _msu_rpc = (uint32)((((_msu_rpch << 8) | _msu_rpcl) + 1) & 0xffffu); "
+        f"uint32 _msu_rpc24 = ((uint32)cpu->PB << 16) | _msu_rpc; "
+        f"if (_hrv == 2 && _msu_ret_s == _entry_s && "
+        f"_msu_rpc24 != _host_return_pc24 && !cpu_dispatch_has_entry(cpu, _msu_rpc24)) {{ "
+        f"RecompStackPop(); return interp_tier_dispatch_rewritten_return(cpu, _msu_rpc24, {source_pc}); }} "
+        f"if (_hrv == 2 && _msu_ret_s == _entry_s && _msu_rpc24 == _host_return_pc24) {{ "
+        f"RecompStackPop(); return RECOMP_RETURN_NORMAL; }} "
+        f"if (_msu_ret_s != _entry_s) {{ int _msu_anc_skip = cpu_resolve_ancestor_skip(_msu_ret_s); "
+        f"if (_msu_anc_skip >= 0) {{ cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE); "
+        f"RecompStackPop(); return (RecompReturn)_msu_anc_skip; }} "
+        f"if ((uint16)(_msu_ret_s - _entry_s) < 0x8000u && interp_bridge_has_direct_paired_bounce()) {{ "
+        f"RecompStackPop(); return interp_tier_dispatch_rewritten_return(cpu, _msu_rpc24, {source_pc}); }} }} "
+        f"if (_msu_ret_s != _entry_s && cpu->S == _entry_s && interp_bridge_has_direct_paired_bounce()) {{ "
+        f"RecompStackPop(); return interp_tier_dispatch_rewritten_return(cpu, _msu_rpc24, {source_pc}); }} "
+        f"if (_msu_ret_s != _entry_s && (uint16)(_entry_s - _msu_ret_s) < 0x8000u && "
+        f"cpu->S != _entry_s && (uint16)(cpu->S - _entry_s) < 0x8000u) {{ "
+        f"RecompStackPop(); return interp_tier_dispatch_rewritten_return(cpu, _msu_rpc24, {source_pc}); }} "
+        f"if (_msu_ret_s != _entry_s && (uint16)(_entry_s - _msu_ret_s) < 0x8000u && "
+        f"!cpu_dispatch_has_entry(cpu, _msu_rpc24)) {{ RecompStackPop(); "
+        f"return interp_tier_dispatch_popped_return(cpu, _msu_rpc24, {source_pc}, (uint16)(_entry_s + 2u)); }} "
+        f"cpu_trace_mark_nlr_exit(BD_EXIT_KIND_TRAMPOLINE); RecompStackPop(); "
+        f"return cpu_dispatch_pc_from(cpu, _msu_rpc24, (uint16)(_entry_s + 2u), {source_pc}); }} }}\n")
+
+
+def msu1_music_snippet(indent, source_pc):
+    return msu1_music_rts_snippet(indent, source_pc, "/*MSU1-MUSIC*/")
+
+
+def apply_msu1_music(lines, verbose):
+    out = []
+    in_music_fn = False
+    n = 0
+    for line in lines:
+        out.append(line)
+        if RE_MSU1_MUSIC_ENTRY.match(line):
+            in_music_fn = True
+            source_pc = "0x8087b0u" if "bank_80_" in line else "0x0087b0u"
+            continue
+        if in_music_fn:
+            m = RE_MSU1_MUSIC_ANCHOR.match(line)
+            if m:
+                out.append(msu1_music_snippet(m.group(1), source_pc))
+                n += 1
+                in_music_fn = False
+                if verbose:
+                    print(f"  MSU1-MUSIC after line {len(out) - 1}")
+                continue
+        if line.startswith("RecompReturn "):
+            in_music_fn = False
+    return out, n
+
+
+RE_MSU1_STAGE_BLOCK = re.compile(
+    r"^(\s*)cpu_trace_block\(cpu, 0x009A2D\);\s*$")
+RE_MSU1_STAGE_TAIL = re.compile(
+    r"^(\s*)\{ extern RecompReturn bank_00_87B0_M1X1\(CpuState \*cpu\); ")
+
+
+def apply_msu1_stage_load(lines, verbose):
+    out = []
+    in_stage_block = False
+    n = 0
+    for line in lines:
+        m_tail = RE_MSU1_STAGE_TAIL.match(line) if in_stage_block else None
+        if m_tail:
+            out.append(msu1_music_rts_snippet(
+                m_tail.group(1), "0x009a2du", "/*MSU1-STAGE*/"))
+            n += 1
+            in_stage_block = False
+            if verbose:
+                print(f"  MSU1-STAGE before line {len(out) + 1}")
+        out.append(line)
+        if RE_MSU1_STAGE_BLOCK.match(line):
+            in_stage_block = True
+            continue
+        if in_stage_block and line.startswith("  L_"):
+            in_stage_block = False
+    return out, n
+
+
+def apply_bank00(lines, verbose):
+    out = []
+    cur_block = None
+    n = 0
+    # NOTE: the WS-SHADOW pass (B23C staging note -> MmxWsShadowStageNote)
+    # belongs to the tier-2 stage-prefill subsystem, which has NOT been
+    # ported to this branch (no host-side consumer exists). It must come
+    # back together with that port; injecting it alone is a link error.
+    for line in lines:
+        out.append(line)
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            continue
+        m = RE_STORE00.match(line)
+        if m and cur_block in (0x00DC78, 0x00DC62):
+            which = "Right" if cur_block == 0x00DC78 else "Left"
+            out.append(spawn_snippet(
+                m.group(1), m.group(2), m.group(3), which))
+            n += 1
+            if verbose:
+                print(f"  WS-SPAWN {which} after line {len(out) - 1} "
+                      f"(block {cur_block:#08x})")
+    return out, n
+
+
+RE_SPAWN_TYPE_READ = re.compile(
+    r"^(\s*)uint8 (_v\d+) = cpu_read8\(cpu, cpu->DB, \(uint16\)\("
+    r"cpu_read16\(cpu, 0x00, \(uint16\)\(cpu->D \+ 0x0018\)\)\)\);\s*$")
+RE_SPAWN_POST_CALL = re.compile(
+    r"^(\s*)goto L_DC92_M0X0; /\* implicit fall-through \*/\s*$")
+
+
+def apply_bank00_spawn_pass(lines, verbose):
+    """Partition DCDB between wide-owned and native-owned records."""
+    out = []
+    cur_fn = None
+    cur_block = None
+    n = 0
+    for line in lines:
+        m = re.match(r"^RecompReturn (bank_00_[0-9A-F]+)_M\dX\d\(CpuState", line)
+        if m:
+            cur_fn = m.group(1)
+            cur_block = None
+        elif line.startswith("RecompReturn "):
+            cur_fn = None
+            cur_block = None
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+
+        if cur_fn == "bank_00_DCDB" and cur_block == 0x00DD2D:
+            m = RE_SPAWN_TYPE_READ.match(line)
+            if m:
+                out.append(line)
+                out.append(
+                    f"{m.group(1)}/*WS-SPAWN-PASS*/ {{ extern int "
+                    f"MmxWsSpawnRecordAllowed(uint16, uint8); if "
+                    f"(!MmxWsSpawnRecordAllowed(cpu->D, {m.group(2)})) "
+                    f"goto L_DD94_M1X0; }}\n")
+                n += 1
+                continue
+
+        if cur_fn == "bank_00_DC36" and cur_block == 0x00DC81:
+            m = RE_SPAWN_POST_CALL.match(line)
+            if m:
+                out.append(
+                    f"{m.group(1)}/*WS-SPAWN-PASS*/ {{ extern void "
+                    f"MmxWsSpawnRunNativePass(CpuState *); "
+                    f"MmxWsSpawnRunNativePass(cpu); }}\n")
+                out.append(line)
+                n += 1
+                continue
+        if cur_fn == "bank_00_DC36" and cur_block == 0x00DC92 and line.strip() == "cpu->coprocessor_master_cycles = cpu->master_cycles;":
+            out.append(line)
+            out.append("    /*WS-SPAWN-PASS*/ { extern void MmxWsCollectiblePass(CpuState *); MmxWsCollectiblePass(cpu); }\n")
+            n += 1
+            continue
+        out.append(line)
+    if verbose and n:
+        print(f"  WS-SPAWN-PASS injected {n} site(s)")
+    return out, n
+
+
+def apply_barrier_enemies(lines, verbose):
+    """Keep the fortress empty-room check independent of adjacent wide enemies."""
+    out, block, count = [], None, 0
+    for line in lines:
+        out.append(line)
+        match = RE_TRACE.search(line)
+        if match:
+            block = canon_pc24(int(match.group(1), 16))
+        if block == 0x07F7C5:
+            match = re.match(r"^(\s*)uint16 (_v\d+) = cpu_read16\(cpu,.*cpu->X", line)
+            if match:
+                indent, var = match.groups()
+                out.append(f"{indent}/*WS-BARRIER-ENEMIES*/ {{ extern uint16 MmxWsBarrierEnemyState(uint16, uint16, uint16); {var} = MmxWsBarrierEnemyState(cpu->D, cpu->X, {var}); }}\n")
+                count += 1
+    if verbose and count:
+        print(f"  WS-BARRIER-ENEMIES injected {count} site(s)")
+    return out, count
+
+
+def oam_limit_snippet(indent, var):
+    return (f"{indent}/*WS-OAM*/ {{ extern uint16 MmxWsOamRightLimit(uint16); "
+            f"{var} = MmxWsOamRightLimit({var}); }}\n")
+
+
+def apply_bank00_oam(lines, verbose):
+    """Widen bank_00_D76A's shared per-metasprite-tile right-edge gate."""
+    out = []
+    cur_fn = None
+    cur_block = None
+    n = 0
+    for line in lines:
+        out.append(line)
+        m = re.match(r"^RecompReturn (bank_00_D76A)_M\dX\d\(CpuState", line)
+        if m:
+            cur_fn = m.group(1)
+            cur_block = None
+            continue
+        if line.startswith("RecompReturn "):
+            cur_fn = None
+            cur_block = None
+            continue
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            continue
+        if cur_fn == "bank_00_D76A" and cur_block == 0x00D79F:
+            m = RE_CONST10F.match(line)
+            if m:
+                out.append(oam_limit_snippet(m.group(1), m.group(2)))
+                n += 1
+                if verbose:
+                    print(f"  WS-OAM after line {len(out) - 1} "
+                          f"(bank_00_D76A, {m.group(2)})")
+    return out, n
+
+
+RE_OAM_LIMIT_INJ = re.compile(
+    r"MmxWsOamRightLimit\(uint16\); (_v\d+) = MmxWsOamRightLimit")
+
+
+def apply_bank00_oam_left(lines, verbose):
+    """Replace bank_00_D76A's unsigned X-gate verdict so left-margin
+    sprites are emitted too. The vanilla verdict is one unsigned compare,
+    C = (screenX + 0x10) >= limit; negative screen X wraps high and
+    always rejects, i.e. sprites vanish at the native LEFT edge no
+    matter how far WS-OAM widens the right limit. Runs after the WS-OAM
+    pass (its own applier + marker so it also lands on gen that already
+    carries WS-OAM), keying on the injected right-limit line to learn
+    the limit variable."""
+    out = []
+    limit_var = None
+    n = 0
+    for line in lines:
+        out.append(line)
+        m = RE_OAM_LIMIT_INJ.search(line)
+        if m:
+            limit_var = m.group(1)
+            continue
+        if limit_var:
+            m = re.match(
+                r"^(\s*)cpu->_flag_C = \(\((_v\d+) & 0xFFFF\) >= "
+                r"\((" + limit_var + r") & 0xFFFF\)\) \? 1 : 0;", line)
+            if m:
+                out.append(
+                    f"{m.group(1)}/*WS-OAM-L*/ {{ extern uint16 "
+                    f"MmxWsOamXReject(uint16, uint16); cpu->_flag_C = "
+                    f"MmxWsOamXReject((uint16)({m.group(2)}), "
+                    f"(uint16)({limit_var})); }}\n")
+                limit_var = None
+                n += 1
+                if verbose:
+                    print(f"  WS-OAM-L after line {len(out) - 1} "
+                          f"(bank_00_D76A, {m.group(2)})")
+    return out, n
+
+
+def stage_snippet(indent, var):
+    return (f"{indent}/*WS-STAGE*/ {{ extern uint16 MmxWsStageLineAdjust"
+            f"(uint16, uint16, uint16); {var} = MmxWsStageLineAdjust("
+            f"{var}, cpu->D, cpu->X); }}\n")
+
+
+def apply_bank03(lines, verbose):
+    out = []
+    cur_fn = None
+    n = 0
+    for line in lines:
+        out.append(line)
+        m = RE_FUNC.match(line)
+        if m:
+            cur_fn = m.group(1)
+            continue
+        if cur_fn in ("bank_03_FDD3", "bank_83_FDD3"):
+            m = RE_CMP_DX.match(line)
+            if m:
+                out.append(stage_snippet(m.group(1), m.group(2)))
+                n += 1
+                if verbose:
+                    print(f"  WS-STAGE after line {len(out) - 1} "
+                          f"(bank_03_FDD3, {m.group(2)})")
+    return out, n
+
+
+def apply_bank02(lines, verbose):
+    out = []
+    cur_block = None
+    pend_val = None
+    state = 0  # 0 idle, 1 saw 0x180 const, 2 have value var
+    n = 0
+    for line in lines:
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            state = 0
+        if cur_block == 0x02806E:
+            if state == 0 and RE_CONST180.match(line):
+                state = 1
+            elif state == 1:
+                mv = RE_READ_A.match(line)
+                if mv:
+                    pend_val = mv.group(1)
+                    state = 2
+            elif state == 2:
+                mb = RE_BRANCH_C.match(line)
+                if mb:
+                    out.append(cull_snippet(mb.group(1), pend_val))
+                    n += 1
+                    if verbose:
+                        print(f"  WS-CULL before line {len(out)} "
+                              f"(block 0x02806E, {pend_val})")
+                    state = 0
+        out.append(line)
+    return out, n
+
+
+def activation_snippet(indent, var):
+    return (f"{indent}/*WS-ACTIVATE*/ {{ extern uint16 "
+            f"MmxWsEnemyActivationDistance(uint16, uint16); {var} = "
+            f"MmxWsEnemyActivationDistance({var}, cpu->D); }}\n")
+
+
+def apply_bank82_shot_cull(lines, verbose):
+    """Widen the common projectile X-axis lifetime test in bank_82_80B4."""
+    out = []
+    cur_block = None
+    pend_val = None
+    state = 0  # 0 idle, 1 saw 0x140 const, 2 have compared value var
+    n = 0
+    for line in lines:
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            state = 0
+        if cur_block == 0x0280B4:
+            if state == 0 and RE_CONST140.match(line):
+                state = 1
+            elif state == 1:
+                mv = RE_READ_A.match(line)
+                if mv:
+                    pend_val = mv.group(1)
+                    state = 2
+            elif state == 2:
+                mb = RE_BRANCH_C.match(line)
+                if mb:
+                    out.append(shot_cull_snippet(mb.group(1), pend_val))
+                    n += 1
+                    if verbose:
+                        print(f"  WS-SHOT-CULL before line {len(out)} "
+                              f"(block 0x0280B4, {pend_val})")
+                    state = 0
+        out.append(line)
+    return out, n
+
+
+def apply_bank82_presentation_cull(lines, verbose):
+    """Widen bank_82_808F's first, horizontal presentation-object gate."""
+    out = []
+    cur_fn = None
+    cur_block = None
+    pend_val = None
+    state = 0  # 0 idle, 1 saw 0x1c0 const, 2 have compared value var
+    n = 0
+    for line in lines:
+        m = re.match(r"^RecompReturn (bank_82_808F)_M\dX\d\(CpuState", line)
+        if m:
+            cur_fn = m.group(1)
+            cur_block = None
+            state = 0
+        elif line.startswith("RecompReturn "):
+            cur_fn = None
+            cur_block = None
+            state = 0
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            state = 0
+        if cur_fn == "bank_82_808F" and cur_block == 0x02808F:
+            if state == 0 and re.match(r"^\s*uint16 (_v\d+) = 0x1c0;\s*$", line):
+                state = 1
+            elif state == 1:
+                mv = RE_READ_A.match(line)
+                if mv:
+                    pend_val = mv.group(1)
+                    state = 2
+            elif state == 2:
+                mb = RE_BRANCH_C.match(line)
+                if mb:
+                    out.append(presentation_cull_snippet(mb.group(1), pend_val))
+                    n += 1
+                    if verbose:
+                        print(f"  WS-PRESENTATION-CULL before line {len(out)} "
+                              f"(block 0x02808F, {pend_val})")
+                    state = 0
+        out.append(line)
+    return out, n
+
+
+def apply_bank82_activation(lines, verbose):
+    """Widen the Highway helicopter's descent gate after native arena entry.
+
+    bank_82_B964 holds the helicopter just above the viewport until its
+    controller is 0x80 pixels ahead of X.  That is exactly the native
+    viewport entrance point.  The helper adds the live right margin and the
+    large sprite's lead distance while preserving 0x80 when widescreen
+    spawning is disabled.
+    """
+    lines = [line for line in lines if '/*WS-ACTIVATE*/' not in line]
+    out = []
+    cur_block = None
+    n = 0
+    for line in lines:
+        out.append(line)
+        m = RE_TRACE.search(line)
+        if m:
+            cur_block = canon_pc24(int(m.group(1), 16))
+            continue
+        if cur_block == 0x02B964:
+            m = RE_CONST80.match(line)
+            if m:
+                out.append(activation_snippet(m.group(1), m.group(2)))
+                n += 1
+                if verbose:
+                    print(f"  WS-ACTIVATE after line {len(out) - 1} "
+                          f"(block 0x02B964, {m.group(2)})")
+    return out, n
+
+
+def apply_flyer_leash(lines, verbose):
+    """The pink flyer's spawn leash must include the custom view's margin."""
+    out, block, count = [], None, 0
+    for line in lines:
+        out.append(line)
+        trace = RE_TRACE.search(line)
+        if trace:
+            block = canon_pc24(int(trace.group(1), 16))
+        match = re.match(r"^(\s*)uint16 (_v\d+) = 0xa0;\s*$", line)
+        if block == 0x03DF71 and match:
+            out.append(f"{match[1]}/*WS-FLYER-LEASH*/ {{ extern uint16 MmxWsFlyerLeashLimit(void); {match[2]} = MmxWsFlyerLeashLimit(); }}\n")
+            count += 1
+    return out, count
+
+
+def apply_streaker_entry(lines, verbose):
+    """Keep native timing, but start the moving actor beyond the wide edge."""
+    # Migrate the previous spike's parked-actor hook in existing generations.
+    lines = [line for line in lines if '/*WS-STREAKER-WAIT*/' not in line]
+    out, count, block = [], 0, None
+    for line in lines:
+        out.append(line)
+        trace = RE_TRACE.search(line)
+        if trace:
+            block = canon_pc24(int(trace[1], 16))
+        # After the deadline guard so a yield cannot apply the offset twice.
+        if block == 0x07A590 and 'cpu->coprocessor_master_cycles = cpu->master_cycles;' in line:
+            indent = line[:len(line) - len(line.lstrip())]
+            out.append(f"{indent}/*WS-STREAKER-ENTRY*/ {{ extern void MmxWsStreakerEntrance(uint16); MmxWsStreakerEntrance(cpu->D); }}\n")
+            count += 1
+    return out, count
+
+
+def apply_chain_platform(lines, verbose):
+    """Widen only the chain-platform create/remove switches at $81:F97A."""
+    out, block, count = [], None, 0
+    for line in lines:
+        out.append(line)
+        trace = RE_TRACE.search(line)
+        if trace:
+            block = canon_pc24(int(trace[1], 16))
+        match = re.match(r"^(\s*)uint16 (_v\d+) = cpu_read16\(cpu, 0x00, \(uint16\)\(cpu->D \+ 0x0000 \+ cpu->X\)\);", line)
+        if block == 0x01F97A and match:
+            out.append(f"{match[1]}/*WS-CHAIN-PLATFORM*/ {{ extern uint16 MmxWsChainPlatformLine(CpuState *, uint16); {match[2]} = MmxWsChainPlatformLine(cpu, {match[2]}); }}\n")
+            count += 1
+    return out, count
+
+
+def apply_ride_armor_cull(lines, verbose):
+    """Widen only the first (horizontal) compare in $83:8948."""
+    out, block, compared, pending, count = [], None, None, False, 0
+    for line in lines:
+        trace = RE_TRACE.search(line)
+        if trace:
+            block = canon_pc24(int(trace.group(1), 16))
+            compared, pending = None, False
+        if block == 0x038948:
+            if re.match(r"^\s*uint16 _v\d+ = 0x200;\s*$", line):
+                pending = True
+            match = RE_READ_A.match(line)
+            if pending and match:
+                compared = match[1]
+                pending = False
+            branch = RE_BRANCH_C.match(line)
+            if compared and branch:
+                out.append(f"{branch[1]}/*WS-ARMOR-CULL*/ {{ extern uint16 MmxWsRideArmorCullVerdictX(uint16); cpu->_flag_C = MmxWsRideArmorCullVerdictX({compared}); }}\n")
+                count += 1
+                compared = None
+        out.append(line)
+    return out, count
+
+
+RE_CHRBIND_ANCHOR = re.compile(
+    r"^\s*uint8 (_v\d+) = cpu_read8\(cpu, \(uint8\)\(\(\(\(uint32\)0x7f8200 "
+    r"\+ \(uint32\)cpu->X\)\) >> 16\), \(uint16\)\(\(\(uint32\)0x7f8200 \+ "
+    r"\(uint32\)cpu->X\)\)\);\s*$")
+RE_CHRBIND_STORE_D18 = re.compile(
+    r"^(\s*)cpu_write8\(cpu, 0x00, \(uint16\)\(cpu->D \+ 0x0018\), _v\d+\);\s*$")
+# Defensive regen-drift guards: if cpu->X or cpu->D get reassigned between
+# the anchor and the tile-base store, the injection point's premise (X/D
+# still hold this bind's own values) is broken and the anchor must be
+# abandoned rather than silently injecting a wrong observation.
+RE_CHRBIND_X_ASSIGN = re.compile(r"cpu->X\s*=[^=]")
+RE_CHRBIND_D_ASSIGN = re.compile(r"cpu->D\s*=[^=]")
+
+# Bounded forward-scan window (lines) from the anchor to the tile-base
+# store. Measured across all 8 real sites the store lands 6-7 lines after
+# the anchor (a fixed few flag-update lines emitted for the LDA and the
+# STA); ~40 gives generous headroom for regen drift without being large
+# enough to wander into an unrelated store.
+CHRBIND_WINDOW = 40
+# Verified 2026-08-06 by per-site inspection (see the module docstring):
+# exactly 8 real tile-base bind sites match the anchor across src/gen.
+EXPECTED_CHRBIND_SITES = 8
+EXPECTED_CHRBIND_SITE_NAMES = (
+    "bank_82_827D_M1X1", "bank_82_EDA5_M1X1", "bank_82_F554_M1X1",
+    "bank_83_F945_M1X1", "bank_87_B824_M1X1", "bank_87_F42A_M1X1",
+    "bank_87_F477_M1X1", "bank_88_EAA4_M1X1",
+)
+
+
+def chrbind_snippet(indent):
+    return (f"{indent}/*WS-CHRBIND*/ {{ extern void MmxWsChrBindNote(uint16, "
+            f"uint16); MmxWsChrBindNote(cpu->D, cpu->X); }}\n")
+
+
+def apply_chrbind_generic(lines, verbose):
+    """Pattern-based WS-CHRBIND pass: find every inlined OAM tile-base bind
+    (the `0x7f8200 + cpu->X` read, common to all 8 verified sites) and
+    inject the host observability hook immediately after that same bind's
+    tile-base store (`cpu->D + 0x0018`). See the module docstring's
+    WS-CHRBIND section for why the injection point is the tile-base store
+    and not the (non-uniform) palette store."""
+    out = []
+    n = 0
+    pending_var = None
+    pending_age = 0
+    for idx, line in enumerate(lines):
+        out.append(line)
+        if pending_var is not None:
+            pending_age += 1
+            if RE_CHRBIND_X_ASSIGN.search(line) or RE_CHRBIND_D_ASSIGN.search(line):
+                if verbose:
+                    print(f"  WS-CHRBIND: cpu->X/D reassigned before the "
+                          f"tile-base store near line {idx + 1}; abandoning "
+                          f"this anchor")
+                pending_var = None
+            elif pending_age > CHRBIND_WINDOW:
+                if verbose:
+                    print(f"  WS-CHRBIND: no tile-base store found within "
+                          f"{CHRBIND_WINDOW} lines of the anchor near line "
+                          f"{idx + 1}; abandoning this anchor")
+                pending_var = None
+            else:
+                m = RE_CHRBIND_STORE_D18.match(line)
+                if m:
+                    already = (idx + 1 < len(lines) and
+                               "/*WS-CHRBIND*/" in lines[idx + 1])
+                    if not already:
+                        out.append(chrbind_snippet(m.group(1)))
+                        if verbose:
+                            print(f"  WS-CHRBIND after line {len(out) - 1}")
+                    n += 1
+                    pending_var = None
+        if pending_var is None:
+            m = RE_CHRBIND_ANCHOR.match(line)
+            if m:
+                pending_var = m.group(1)
+                pending_age = 0
+    return out, n
+
+
+RE_CHRBIND_COPY_ANCHOR = re.compile(
+    r"^\s*uint8 (_v\d+) = cpu_read8\(cpu, 0x00, \(uint16\)\(cpu->D \+ 0x0018\)\);\s*$")
+RE_CHRBIND_COPY_WRITE_A_M = re.compile(
+    r"^\s*cpu_write_a_m\(cpu, \(uint16\)\((_v\d+)\)\);\s*$")
+RE_CHRBIND_COPY_READ_A16 = re.compile(
+    r"^\s*uint16 (_v\d+) = cpu_read_a16\(cpu\);\s*$")
+RE_CHRBIND_COPY_STORE = re.compile(
+    r"^(\s*)cpu_write8\(cpu, [^;]*0x0018 \+ \(uint32\)cpu->X[^;]*, (_v\d+)\);\s*$")
+
+# Bounded forward-scan window from the anchor to the chained store. Measured
+# across all 42 real sites the store lands 5-6 lines after the anchor (the
+# write_a_m + a fixed few flag-update lines + the read_a16); 12 gives
+# headroom for regen drift without being large enough to wander into an
+# unrelated store that happens to share the "0x0018 + cpu->X" destination.
+CHRBIND_COPY_WINDOW = 12
+# Verified 2026-08-06 by scanning all of src/gen for the anchor -> chained
+# accumulator forward -> "0x0018 + cpu->X" store shape, then per-site
+# inspection of every match (see the module docstring's WS-CHRBIND-COPY
+# section): exactly 42 real sites, none excluded as false positives.
+EXPECTED_CHRBIND_COPY_SITES = 42
+EXPECTED_CHRBIND_COPY_SITE_NAMES = (
+    "bank_01_C20A_M1X1", "bank_81_A979_M1X1", "bank_81_C20A_M1X1",
+    "bank_81_C39F_M1X1", "bank_81_C3CB_M1X1", "bank_81_DB73_M1X1",
+    "bank_81_DBA5_M1X1", "bank_81_DBD7_M1X1", "bank_81_E2F0_M1X1",
+    "bank_82_9AF4_M1X1", "bank_82_C331_M1X1", "bank_82_CBBB_M1X1",
+    "bank_82_CCEB_M1X1", "bank_82_DE94_M1X1", "bank_82_E1B9_M1X1",
+    "bank_83_AE95_M1X1", "bank_83_B109_M1X1", "bank_83_C316_M1X1",
+    "bank_83_C4C0_M1X1", "bank_83_C4CE_M1X1", "bank_83_D9AF_M1X1",
+    "bank_83_DA2E_M1X1", "bank_83_E6C4_M1X1", "bank_87_9A90_M1X0",
+    "bank_87_9ADB_M1X0", "bank_87_B3D7_M1X1", "bank_87_BB6F_M1X1",
+    "bank_87_BF17_M1X1", "bank_87_CA3F_M1X1", "bank_87_D492_M1X1",
+    "bank_87_D7F7_M1X1", "bank_87_DFCD_M1X1", "bank_87_E62A_M1X1",
+    "bank_87_ECD9_M1X1", "bank_88_8413_M1X1", "bank_88_84B0_M1X1",
+    "bank_88_B17E_M1X1", "bank_88_BB21_M1X1", "bank_88_BE06_M1X1",
+    "bank_88_D8E3_M1X1", "bank_88_DF08_M1X1", "bank_88_E2CB_M1X1",
+)
+
+
+def chrbind_copy_snippet(indent):
+    return (f"{indent}/*WS-CHRBIND-COPY*/ {{ extern void "
+            f"MmxWsChrBindNoteCopy(uint16, uint16); "
+            f"MmxWsChrBindNoteCopy(cpu->D, cpu->X); }}\n")
+
+
+def apply_chrbind_copy_generic(lines, verbose):
+    """Pattern-based WS-CHRBIND-COPY pass: find every inlined "copy my own
+    tile-base to a sibling/child object" idiom (LDA [D+0x18] / STA
+    0x0018,X, verified via the accumulator-forwarding chain, not just the
+    bare anchor read -- see the module docstring's WS-CHRBIND-COPY section
+    for why the bare anchor alone is not selective enough) and inject the
+    host observability hook immediately after that same chain's store."""
+    out = []
+    n = 0
+    i = 0
+    L = len(lines)
+    while i < L:
+        line = lines[i]
+        m = RE_CHRBIND_COPY_ANCHOR.match(line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        anchor_var = m.group(1)
+        if i + 1 >= L:
+            out.append(line)
+            i += 1
+            continue
+        mw = RE_CHRBIND_COPY_WRITE_A_M.match(lines[i + 1])
+        if not (mw and mw.group(1) == anchor_var):
+            out.append(line)
+            i += 1
+            continue
+        # Bounded forward scan for the read_a16 -> chained store, abandoning
+        # if cpu->X/cpu->D get reassigned before the store completes (same
+        # regen-drift safety as WS-CHRBIND).
+        accum_var = None
+        store_idx = None
+        abandon = False
+        limit = min(i + 1 + CHRBIND_COPY_WINDOW, L)
+        for j in range(i + 2, limit):
+            ln = lines[j]
+            if RE_CHRBIND_X_ASSIGN.search(ln) or RE_CHRBIND_D_ASSIGN.search(ln):
+                abandon = True
+                break
+            if accum_var is None:
+                mr = RE_CHRBIND_COPY_READ_A16.match(ln)
+                if mr:
+                    accum_var = mr.group(1)
+                continue
+            ms = RE_CHRBIND_COPY_STORE.match(ln)
+            if ms and ms.group(2) == accum_var:
+                store_idx = j
+                break
+        if abandon or store_idx is None:
+            if verbose:
+                print(f"  WS-CHRBIND-COPY: no chained store found (or "
+                      f"cpu->X/D reassigned) within {CHRBIND_COPY_WINDOW} "
+                      f"lines of the anchor near line {i + 1}; abandoning "
+                      f"this anchor")
+            out.append(line)
+            i += 1
+            continue
+        for k in range(i, store_idx + 1):
+            out.append(lines[k])
+        indent = RE_CHRBIND_COPY_STORE.match(lines[store_idx]).group(1)
+        already = (store_idx + 1 < L and
+                   "/*WS-CHRBIND-COPY*/" in lines[store_idx + 1])
+        if not already:
+            out.append(chrbind_copy_snippet(indent))
+            if verbose:
+                print(f"  WS-CHRBIND-COPY after line {len(out) - 1}")
+        n += 1
+        i = store_idx + 1
+    return out, n
+
+
+RE_CHRBIND_PARENT_ANCHOR = re.compile(
+    r"^(\s*)uint8 (_v\d+) = cpu_read8\(cpu, 0x00, "
+    r"\(uint16\)\(cpu->D \+ 0x0018 \+ cpu->X\)\);\s*$")
+EXPECTED_CHRBIND_PARENT_SITES = 1
+
+
+def apply_chrbind_parent(lines, verbose):
+    """Hook D6A7_M1X0's unique object+$18 -> render-scratch+$10 read."""
+    out = []
+    n = 0
+    current_func = None
+    for i, line in enumerate(lines):
+        out.append(line)
+        fm = re.match(r"^RecompReturn (\w+)\(CpuState \*cpu\) \{\s*$", line)
+        if fm:
+            current_func = fm.group(1)
+        if current_func != "bank_00_D6A7_M1X0":
+            continue
+        m = RE_CHRBIND_PARENT_ANCHOR.match(line)
+        if not m:
+            continue
+        already = (i + 1 < len(lines) and
+                   "/*WS-CHRBIND-PARENT*/" in lines[i + 1])
+        if not already:
+            indent, var = m.groups()
+            out.append(
+                f"{indent}/*WS-CHRBIND-PARENT*/ {{ extern uint8 "
+                f"MmxWsChrBindResolveParent(uint16, uint16, uint8); "
+                f"{var} = MmxWsChrBindResolveParent(cpu->D, cpu->X, "
+                f"{var}); }}\n")
+            if verbose:
+                print(f"  WS-CHRBIND-PARENT after line {len(out) - 1}")
+        n += 1
+    return out, n
+
+
+def process(path, fn, check, verbose):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.readlines()
+    out, n = fn(lines, verbose)
+    if n and not check:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.writelines(out)
+    return n
+
+
+def restore_file(path, verbose):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.readlines()
+    out = [ln for ln in lines if not any(mk in ln for mk in MARKERS)]
+    n = len(lines) - len(out)
+    if n:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.writelines(out)
+    return n
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gen-dir", default="src/gen")
+    ap.add_argument("--restore", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    # Sharded, mirror-bank-keyed generation: anchor patterns are gated on
+    # block PCs / function symbols, so every applier can safely run over
+    # every generated translation unit; non-matching files are no-ops.
+    appliers = (
+        (apply_bank00, "/*WS-SPAWN*/"),
+        (apply_bank00_spawn_pass, "/*WS-SPAWN-PASS*/"),
+        (apply_bank00_oam, "/*WS-OAM*/"),
+        (apply_bank00_oam_left, "/*WS-OAM-L*/"),
+        (apply_bank02, "/*WS-CULL*/"),
+        (apply_bank82_presentation_cull, "/*WS-PRESENTATION-CULL*/"),
+        (apply_bank82_shot_cull, "/*WS-SHOT-CULL*/"),
+        (apply_bank82_activation, "/*WS-ACTIVATE*/"),
+        (apply_flyer_leash, "/*WS-FLYER-LEASH*/"),
+        (apply_streaker_entry, "/*WS-STREAKER-ENTRY*/"),
+        (apply_chain_platform, "/*WS-CHAIN-PLATFORM*/"),
+        (apply_barrier_enemies, "/*WS-BARRIER-ENEMIES*/"),
+        (apply_ride_armor_cull, "/*WS-ARMOR-CULL*/"),
+        (apply_bank03, "/*WS-STAGE*/"),
+        (apply_chrbind_generic, "/*WS-CHRBIND*/"),
+        (apply_chrbind_copy_generic, "/*WS-CHRBIND-COPY*/"),
+        (apply_chrbind_parent, "/*WS-CHRBIND-PARENT*/"),
+        (apply_msu1_stage_load, "/*MSU1-STAGE*/"),
+        (apply_msu1_music, "/*MSU1-MUSIC*/"),
+    )
+    paths = sorted(glob.glob(os.path.join(args.gen_dir, "bank*_v2.c")))
+    if not paths:
+        print(f"no bank*_v2.c under {args.gen_dir}", file=sys.stderr)
+        return 1
+    total = 0
+    patched_files = 0
+    effective_counts = {}
+    for path in paths:
+        name = os.path.basename(path)
+        if args.restore:
+            n = restore_file(path, args.verbose)
+            if n:
+                print(f"{name}: removed {n} injected line(s)")
+            total += n
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            contents = f.read()
+        n_file = 0
+        already = 0
+        for fn, marker in appliers:
+            with open(path, "r", encoding="utf-8") as f:
+                contents = f.read()
+            stale_activation = (fn is apply_bank82_activation and
+                                'MmxWsEnemyActivationDistance(uint16);' in contents)
+            stale_collectibles = (fn is apply_bank00_spawn_pass and 'RecompReturn bank_00_DC36_' in contents
+                                  and 'MmxWsCollectiblePass(cpu)' not in contents)
+            stale_shot_cull = (fn is apply_bank82_shot_cull and
+                               'MmxWsShotCullVerdictX(uint16);' in contents)
+            if stale_collectibles or stale_shot_cull:
+                lines = [line for line in contents.splitlines(keepends=True) if marker not in line]
+                if not args.check:
+                    with open(path, 'w', encoding='utf-8', newline='') as f:
+                        f.writelines(lines)
+            if marker in contents and not stale_activation and not stale_collectibles and not stale_shot_cull:
+                effective_counts[marker] = (
+                    effective_counts.get(marker, 0) + contents.count(marker))
+                already += 1
+                continue
+            n = process(path, fn, args.check, args.verbose)
+            effective_counts[marker] = effective_counts.get(marker, 0) + n
+            n_file += n
+        if n_file:
+            verb = "would inject" if args.check else "injected"
+            print(f"{name}: {verb} {n_file} site(s)")
+        elif already:
+            patched_files += 1
+        total += n_file
+    if args.restore:
+        print(f"restore: removed {total} injected line(s) total")
+    if not args.restore and effective_counts.get("/*WS-SPAWN*/", 0) != 2:
+        print(
+            "ERROR: expected exactly 2 WS-SPAWN anchor hooks, found "
+            f"{effective_counts.get('/*WS-SPAWN*/', 0)}",
+            file=sys.stderr)
+        return 1
+    if not args.restore and effective_counts.get("/*WS-PRESENTATION-CULL*/", 0) != 3:
+        print(
+            "ERROR: expected exactly 3 WS-PRESENTATION-CULL hooks, found "
+            f"{effective_counts.get('/*WS-PRESENTATION-CULL*/', 0)}",
+            file=sys.stderr)
+        return 1
+    chrbind_found = effective_counts.get("/*WS-CHRBIND*/", 0)
+    if not args.restore:
+        for marker, expected in (("/*WS-FLYER-LEASH*/", 1), ("/*WS-ARMOR-CULL*/", 1),
+                                 ("/*WS-SHOT-CULL*/", 4),
+                                 ("/*WS-BARRIER-ENEMIES*/", 1),
+                                 ("/*WS-STREAKER-ENTRY*/", 1), ("/*WS-CHAIN-PLATFORM*/", 2),
+                                 ("/*WS-SPAWN-PASS*/", 4)):
+            if effective_counts.get(marker, 0) != expected:
+                print(f"ERROR: expected exactly {expected} {marker} hook(s), found {effective_counts.get(marker, 0)}", file=sys.stderr)
+                return 1
+    if not args.restore and chrbind_found != EXPECTED_CHRBIND_SITES:
+        print(
+            f"ERROR: expected exactly {EXPECTED_CHRBIND_SITES} WS-CHRBIND "
+            f"anchor hooks, found {chrbind_found}. Expected sites: "
+            f"{', '.join(EXPECTED_CHRBIND_SITE_NAMES)}",
+            file=sys.stderr)
+        return 1
+    chrbind_copy_found = effective_counts.get("/*WS-CHRBIND-COPY*/", 0)
+    if not args.restore and chrbind_copy_found != EXPECTED_CHRBIND_COPY_SITES:
+        print(
+            f"ERROR: expected exactly {EXPECTED_CHRBIND_COPY_SITES} "
+            f"WS-CHRBIND-COPY anchor hooks, found {chrbind_copy_found}. "
+            f"Expected sites: {', '.join(EXPECTED_CHRBIND_COPY_SITE_NAMES)}",
+            file=sys.stderr)
+        return 1
+    chrbind_parent_found = effective_counts.get("/*WS-CHRBIND-PARENT*/", 0)
+    if not args.restore and chrbind_parent_found != EXPECTED_CHRBIND_PARENT_SITES:
+        print(
+            f"ERROR: expected exactly {EXPECTED_CHRBIND_PARENT_SITES} "
+            f"WS-CHRBIND-PARENT anchor hook, found {chrbind_parent_found}.",
+            file=sys.stderr)
+        return 1
+    msu1_music_found = effective_counts.get("/*MSU1-MUSIC*/", 0)
+    if not args.restore and msu1_music_found != 2:
+        print(
+            "ERROR: expected exactly 2 MSU1-MUSIC hooks, found "
+            f"{msu1_music_found}.",
+            file=sys.stderr)
+        return 1
+    msu1_stage_found = effective_counts.get("/*MSU1-STAGE*/", 0)
+    if not args.restore and msu1_stage_found != 1:
+        print(
+            "ERROR: expected exactly 1 MSU1-STAGE hook, found "
+            f"{msu1_stage_found}.",
+            file=sys.stderr)
+        return 1
+    if not args.restore and total == 0 and patched_files == 0:
+        print("WARNING: no anchor sites matched", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

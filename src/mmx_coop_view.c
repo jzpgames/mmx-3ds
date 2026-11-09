@@ -1,0 +1,144 @@
+#include "mmx_coop_view.h"
+#include "mmx_wide_policy.h"
+
+static bool online;
+/* Agreed mod option; actual session gating forces shared views offline. */
+static bool independent=false;
+void MmxCoopViewsSetIndependent(bool enabled) { independent=enabled; }
+bool MmxCoopViewsIndependent(void) { return independent; }
+static MmxCoopViewWorldState world;
+static MmxCoopViewBoundsState bounds;
+static const uint8_t *rom;
+static size_t rom_size;
+void MmxCoopViewsSetRom(const uint8_t *bytes,size_t size) {rom=bytes;rom_size=size;}
+MmxCoopViewBoundsState MmxCoopViewsGetBoundsState(void) {return bounds;}
+bool MmxCoopViewsValidBoundsState(const MmxCoopViewBoundsState *b) {
+  if(!b || b->valid>3 || b->stage>12) return false;
+  for(unsigned seat=0;seat<2;++seat) for(unsigned i=0;i<4;++i)
+    if((b->valid&(1u<<seat)) && b->limits[seat][i]>8192) return false;
+  return true;
+}
+void MmxCoopViewsSetBoundsState(const MmxCoopViewBoundsState *b) {bounds=*b;}
+MmxCoopViewWorldState MmxCoopViewsGetWorldState(void) { return world; }
+void MmxCoopViewsSetWorldState(const MmxCoopViewWorldState *s) { world=*s; }
+void MmxCoopViewsResetWorld(void) { memset(&world,0,sizeof(world));memset(&bounds,0,sizeof(bounds)); }
+void MmxCoopViewsActorReturn(unsigned player) { world.actor_return=(uint8_t)player; }
+void MmxCoopViewsContactPlayer(unsigned player) { world.contact_player=(uint8_t)player; }
+void MmxCoopViewsBeginStage(unsigned stage) {
+  if(!world.initialized || world.stage!=stage) {
+    MmxCoopViewsResetWorld();world.stage=(uint8_t)stage;world.initialized=1;
+  }
+}
+bool MmxCoopViewsSeen(unsigned flag) {
+  return flag>=0xf800 && flag<=0xffff && (world.seen[(flag-0xf800)>>3]&(1u<<(flag&7)));
+}
+void MmxCoopViewsMark(unsigned flag,bool seen) {
+  if(flag<0xf800 || flag>0xffff) return;
+  unsigned n=(flag-0xf800)>>3,bit=1u<<(flag&7);
+  if(seen) world.seen[n]|=bit;else world.seen[n]&=~bit;
+}
+void MmxCoopViewsSetOnline(bool active) { online=active; }
+bool MmxCoopViewsOnline(void) { return online; }
+static int word(const uint8_t *r) { return r[0]|r[1]<<8; }
+static int clamp(int v,int lo,int hi) { if(hi<lo) hi=lo;return v<lo?lo:v>hi?hi:v; }
+static bool living(const MmxCoopPlayer *p) {
+  return p->status==MMX_COOP_ALIVE && (p->body[0x27]&127) && p->body[2]!=12;
+}
+static unsigned rom_word(unsigned address) {
+  size_t offset=0x30000+(address&0x7fff);
+  return rom && offset+2<=rom_size ? (unsigned)word(rom+offset) : 0;
+}
+static unsigned rom_byte(unsigned address) {
+  size_t offset=0x30000+(address&0x7fff);
+  return rom && offset<rom_size ? rom[offset] : 0;
+}
+static void player_limits(const uint8_t *r,const MmxCoopState *s,unsigned seat,
+                          const MmxCoopViewBoundsState *b,int out[4]) {
+  for(unsigned i=0;i<4;++i) out[i]=word(r+0x1e56+i*2);
+  if(online && s->initialized && !s->scene_owner && !s->stage_pending &&
+      seat<2 && b->stage==r[0x1f7a] && (b->valid&(1u<<seat)))
+    for(unsigned i=0;i<4;++i) out[i]=b->limits[seat][i];
+}
+void MmxCoopViewsPlayerLimits(const uint8_t *r,const MmxCoopState *s,unsigned seat,int out[4]) {
+  player_limits(r,s,seat,&bounds,out);
+}
+void MmxCoopViewsUpdateBounds(const uint8_t *r,const MmxCoopState *s) {
+  if(!online || !s->initialized || r[0x1f7a]>12) return;
+  unsigned stage=r[0x1f7a];
+  if(bounds.stage!=stage) {memset(&bounds,0,sizeof(bounds));bounds.stage=(uint8_t)stage;}
+  /* Native scripted rooms and transport still own both cameras. Re-seed
+   * after they release their locks; menus preserve the travel history.
+   * Vile's arena lock ($83:E842) is script-set, absent from region history. */
+  if(s->scene_owner || s->stage_pending || r[0xd3]!=4) {bounds.valid=0;return;}
+  if(s->menu_owner || r[0x1f10]>=6) return;
+  for(unsigned d=0xe68;d<0x1228;d+=64) if(r[d] &&
+      (MmxWidePolicy_IsBossEncounter(r[d+10]) || (stage==9 && (r[d+10]==0x67 || r[d+10]==0x69)) ||
+       (stage==1 && r[d+10]==0x21) || (stage==2 && r[d+10]==9))) {
+    bounds.valid=0;return;
+  }
+  /* Thirteen stage lists precede the first rectangle. The final list has
+   * no following stage pointer; its end is that first rectangle's address. */
+  unsigned data=rom_word(rom_word(0xe4e2));
+  unsigned first=rom_word(0xe4e2+stage*2),end=stage<12?rom_word(0xe4e4+stage*2):data;
+  if(data<0xe4fc || data>=0xecd0 || first<0xe4fc || end<first ||
+      end>data || (end-first)%2) return;
+  static const unsigned targets[4]={0x1e5e,0x1e60,0x1e68,0x1e6e};
+  for(unsigned seat=0;seat<2;++seat) {
+    if(!living(&s->players[seat]) || s->players[seat].zero.swap_phase) {
+      bounds.valid&=(uint8_t)~(1u<<seat);continue;
+    }
+    if(!(bounds.valid&(1u<<seat))) {
+      for(unsigned i=0;i<4;++i) bounds.limits[seat][i]=(uint16_t)word(r+targets[i]);
+      bounds.valid|=(uint8_t)(1u<<seat);
+    }
+    const uint8_t *body=seat==s->current?r+0xba8:s->players[seat].body;
+    unsigned x=word(body+5),y=word(body+8);
+    for(unsigned entry=first;entry<end;entry+=2) {
+      unsigned record=rom_word(entry);
+      if(record<data || record+8>=0xecd0 || x>=rom_word(record) ||
+          x<rom_word(record+2) || y>=rom_word(record+4) || y<rom_word(record+6)) continue;
+      /* Same exclusive upper edges and byte command list as F6E0..F71D.
+       * Only authored camera limits are copied; no guest script runs twice. */
+      for(unsigned n=8;n<40 && record+n<0xecd0;++n) {
+        unsigned command=rom_byte(record+n);if(!command) break;
+        unsigned address=rom_word(0xecd0+(command-1)*4);
+        unsigned value=rom_word(0xecd2+(command-1)*4);
+        if(value>8192) continue;
+        for(unsigned i=0;i<4;++i) if(address==targets[i]) bounds.limits[seat][i]=(uint16_t)value;
+      }
+    }
+  }
+}
+MmxCoopView MmxCoopViewWithBounds(const uint8_t *r,const MmxCoopState *s,unsigned seat,
+                                 const MmxCoopViewBoundsState *b) {
+  MmxCoopView v={word(r+0x1e4d),word(r+0x1e50),s->anchor};
+  if(!online || !s->initialized || seat>1) return v;
+  /* A transported partner watches the native script from its first frame,
+   * including the teleport beams. Fallen/withdrawn seats watch the survivor. */
+  if(s->scene_owner || s->stage_pending || r[0xd3]!=4) return v;
+  const MmxCoopPlayer *p=&s->players[seat];
+  if(!living(p) || p->zero.swap_phase) seat=s->anchor;
+  v.player=seat;
+  if(seat==s->anchor) return v;
+  const uint8_t *body=seat==s->current?r+0xba8:s->players[seat].body;
+  /* Use the authored stage/room camera limits, not the other player's view.
+   * X1's feet lie in the lower dead zone of the 224px native viewport. */
+  int limits[4];player_limits(r,s,seat,b,limits);
+  v.x=clamp(word(body+5)-128,limits[0],limits[1]);
+  v.y=clamp(word(body+8)-160,limits[2],limits[3]);
+  return v;
+}
+MmxCoopView MmxCoopViewForPlayer(const uint8_t *r,const MmxCoopState *s,unsigned seat) {
+  return MmxCoopViewWithBounds(r,s,seat,&bounds);
+}
+bool MmxCoopViewContains(const uint8_t *r,const MmxCoopState *s,int x,int y,
+                         int left,int right,int top,int bottom,int margin) {
+  for(unsigned seat=0;seat<2;++seat) {
+    if(!living(&s->players[seat]) || s->players[seat].zero.swap_phase) continue;
+    if(s->scene_owner && seat!=s->anchor) continue;
+    MmxCoopView v=MmxCoopViewForPlayer(r,s,seat);
+    int dx=(int16_t)(x-v.x),dy=(int16_t)(y-v.y);
+    if(dx>=-left-margin && dx<right+margin && dy>=-top && dy<bottom) return true;
+  }
+  return false;
+}

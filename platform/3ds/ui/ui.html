@@ -1,0 +1,150 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<!-- Source of the bottom-screen artwork (revision 13). gen_ui_assets.py renders
+     it at 1 CSS px = 1 LCD px and crops the backgrounds, the state sprites and
+     the glyphs into ui_assets.c. Dynamic text is drawn by ui.c. -->
+<style>
+  :root { --bg:#0b1426; --panel:#13213b; --panel2:#182a4a; --line:#2a4470;
+          --cyan:#5fd0ff; --cyan2:#9be3ff; --gold:#ffd25a; --text:#e8f2ff;
+          --dim:#8ea6c8; --ok:#59e39a; --warn:#ffb54d; --bad:#ff6b6b; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#000; font-family:"DejaVu Sans", sans-serif; }
+  .screen { width:320px; height:240px; background:var(--bg); position:relative; overflow:hidden;
+            color:var(--text); font-size:9px; }
+  .screen::before { content:""; position:absolute; inset:0;
+    background:
+      repeating-linear-gradient(115deg, transparent 0 14px, rgba(95,208,255,.05) 14px 15px),
+      radial-gradient(120px 80px at 290px 0px, rgba(95,208,255,.18), transparent 70%); }
+  .hdr { position:absolute; left:0; right:0; top:0; height:24px; display:flex; align-items:center;
+         padding:0 8px; background:linear-gradient(#173158,#0f2342); border-bottom:1px solid var(--cyan); }
+  .logo { font-weight:800; font-size:12px; letter-spacing:.5px; }
+  .logo b { color:var(--cyan); }
+  .rev { margin-left:5px; font-size:7px; color:var(--dim); border:1px solid var(--line); border-radius:3px; padding:0 3px; }
+  .chips { margin-left:auto; display:flex; gap:4px; }
+  .chip { font-size:7.5px; font-weight:700; padding:1px 5px; border-radius:8px; background:var(--panel2);
+          border:1px solid var(--line); width:46px; text-align:center; height:12px; }
+  .chip.g { color:var(--ok); border-color:#2f7a55; }
+  .chip.w { color:var(--warn); border-color:#8a5a22; }
+  .chip.c { color:var(--cyan2); }
+  .sec { position:absolute; left:8px; right:8px; }
+  .title { font-size:7px; font-weight:700; color:var(--dim); letter-spacing:1px; margin-bottom:3px; }
+  .slots { display:flex; gap:5px; }
+  .slot { flex:1; height:66px; background:var(--panel); border:1px solid var(--line); border-radius:5px;
+          padding:4px; position:relative; }
+  .slot.sel { border-color:var(--cyan); box-shadow:0 0 0 1px rgba(95,208,255,.35); }
+  .slot .n { font-weight:800; font-size:9px; height:11px; white-space:nowrap; }
+  .thumb { height:20px; margin:2px 0; border-radius:2px; }
+  .thumb.empty { background:repeating-linear-gradient(45deg,#16243f 0 4px,#1b2c4c 4px 8px); }
+  .meta { font-size:6.5px; color:var(--dim); height:8px; }
+  .btns { position:absolute; left:4px; right:4px; bottom:4px; display:flex; gap:3px; }
+  .b { flex:1; text-align:center; font-size:7px; font-weight:800; padding:2px 0; border-radius:3px; height:13px; }
+  .b.save { background:#1f4f7a; color:var(--cyan2); border:1px solid #2f6ea6; }
+  .b.load { background:#3d3a1a; color:var(--gold); border:1px solid #7a6a2a; }
+  .b.off { opacity:.35; }
+  .b.hot { filter:brightness(1.6); }
+  .seg { display:flex; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:2px; gap:2px; }
+  .seg div { flex:1; text-align:center; padding:4px 0 3px; border-radius:4px; font-weight:800; font-size:8.5px; color:var(--dim); }
+  .seg div small { display:block; font-weight:400; font-size:6px; margin-top:1px; }
+  .seg .on { background:linear-gradient(#2a6fa8,#1d4f7d); color:#fff; box-shadow:0 0 0 1px var(--cyan) inset; }
+  .seg .on small { color:var(--cyan2); }
+  .row { display:flex; gap:5px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:4px 5px; height:58px; }
+  .depth { flex:1.1; padding:3px 5px; }
+  .aseg { display:flex; background:#0d1a30; border:1px solid var(--line); border-radius:4px; padding:1px; gap:1px; margin-top:2px; height:14px; }
+  .aseg div { flex:1; text-align:center; font-size:7px; font-weight:800; color:var(--dim); border-radius:3px; line-height:10px; }
+  .aseg .on { background:linear-gradient(#2a6fa8,#1d4f7d); color:#fff; box-shadow:0 0 0 1px var(--cyan) inset; }
+  .aseg .na { opacity:.35; }
+  .vrow { display:flex; align-items:center; gap:3px; margin-top:3px; height:11px; font-size:6.5px; }
+  .vrow .k { color:var(--dim); width:27px; }
+  .vb { width:13px; height:11px; border-radius:3px; background:var(--panel2); border:1px solid var(--line); color:var(--cyan2);
+        font-weight:800; font-size:8px; line-height:9px; text-align:center; }
+  .vbar { flex:1; height:5px; border-radius:3px; background:#0d1a30; overflow:hidden; }
+  .vbar i { display:block; height:100%; background:linear-gradient(90deg,var(--cyan),#b98cff); }
+  .bigv { font-weight:800; font-size:11px; margin-top:2px; height:13px; }
+  .bar { height:5px; border-radius:3px; background:#0d1a30; margin-top:3px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--cyan),#b98cff); }
+  .perf { flex:1.4; display:grid; grid-template-columns:auto 1fr 34px; gap:3px 4px; align-items:center; font-size:6.5px; align-content:start; }
+  .perf .k { color:var(--dim); }
+  .perf .v { text-align:right; font-weight:700; height:8px; }
+  .mini { height:4px; border-radius:2px; background:#0d1a30; overflow:hidden; }
+  .foot { position:absolute; left:0; right:0; bottom:0; height:14px; display:flex; align-items:center; justify-content:space-between;
+          padding:0 8px; font-size:6.5px; color:var(--dim); background:#0a1222; border-top:1px solid var(--line); }
+  .key { color:var(--text); font-weight:700; }
+  .toast { position:absolute; right:8px; top:28px; width:110px; height:10px; font-size:6.5px; font-weight:700; color:var(--ok);
+           background:rgba(20,60,40,.92); border:1px solid #2f7a55; padding:0 5px; border-radius:6px; text-align:center; }
+  .toast.e { color:var(--bad); background:rgba(70,20,24,.92); border-color:#8a3038; }
+  /* detail page */
+  .dcard { position:absolute; left:8px; right:8px; top:42px; height:150px; background:var(--panel);
+           border:1px solid var(--line); border-radius:5px; }
+  .dbtns { position:absolute; left:8px; right:8px; top:198px; display:flex; gap:4px; }
+  .db { flex:1; height:22px; border-radius:4px; background:#1f4f7a; border:1px solid #2f6ea6; }
+  .db.back { background:#2a2f45; border-color:#4a5272; flex:.8; }
+  /* asset switches */
+  .hide { visibility:hidden !important; }
+  .notext, .notext * { color:transparent !important; }
+</style></head>
+<body>
+<div class="screen" id="main">
+  <div class="hdr">
+    <div class="logo"><b>MMX</b> 3DS</div><div class="rev">v1.0.0</div>
+    <div class="chips"><div class="chip g" id="chipF">30 FPS</div><div class="chip c" id="chip3">3D 100%</div></div>
+  </div>
+  <div class="toast" id="toast">✓ Guardado en ranura 2</div>
+
+  <div class="sec" style="top:30px">
+    <div class="title">ESTADOS GUARDADOS</div>
+    <div class="slots">
+      <div class="slot" id="slot0"><div class="n" id="n0">1 Autopista</div><div class="thumb empty" id="t0"></div>
+        <div class="meta" id="m0">Hoy 18:42</div>
+        <div class="btns"><div class="b save" id="g0">GUARDAR</div><div class="b load" id="c0">CARGAR</div></div></div>
+      <div class="slot" id="slot1"><div class="n" id="n1">2 Chill Penguin</div><div class="thumb empty" id="t1"></div>
+        <div class="meta" id="m1">Hoy 19:01</div>
+        <div class="btns"><div class="b save" id="g1">GUARDAR</div><div class="b load" id="c1">CARGAR</div></div></div>
+      <div class="slot" id="slot2"><div class="n" id="n2">3 Vacía</div><div class="thumb empty" id="t2"></div>
+        <div class="meta" id="m2">—</div>
+        <div class="btns"><div class="b save" id="g2">GUARDAR</div><div class="b load off" id="c2">CARGAR</div></div></div>
+    </div>
+  </div>
+
+  <div class="sec" style="top:110px">
+    <div class="title">PANTALLA</div>
+    <div class="seg" id="seg">
+      <div id="s0" class="on">ANCHA<small>estirada nítida</small></div>
+      <div id="s1">4:3<small>nítido, TV</small></div>
+      <div id="s2">PÍXEL<small>1:1 exacto</small></div>
+    </div>
+  </div>
+
+  <div class="sec" style="top:153px">
+    <div class="row">
+      <div class="card depth" id="snd">
+        <div class="title" style="margin:0">SONIDO</div>
+        <div class="aseg" id="aseg"><div id="a0" class="on">SNES</div><div id="a1">MSU-1</div></div>
+        <div class="vrow"><span class="k">Música</span><div class="vb" id="vm0">−</div><div class="vbar" id="vmb"><i id="vfill" style="width:100%"></i></div><div class="vb" id="vm1">+</div></div>
+        <div class="vrow"><span class="k">Efectos</span><div class="vb" id="ve0">−</div><div class="vbar" id="veb"><i id="vfill2" style="width:100%"></i></div><div class="vb" id="ve1">+</div></div>
+      </div>
+      <div class="card perf" id="perf">
+        <div class="title" style="grid-column:1/4;margin:0">RENDIMIENTO <span style="color:var(--cyan)">▾</span></div>
+        <div class="k">Juego</div><div class="mini" id="pb0"></div><div class="v" id="pv0">20,6 ms</div>
+        <div class="k">3D</div><div class="mini" id="pb1"></div><div class="v" id="pv1">14,9 ms</div>
+        <div class="k">Audio</div><div class="mini" id="pb2"></div><div class="v" id="pv2">OK</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot"><span><span class="key">SELECT</span> + <span class="key">L/R</span> guardar/cargar rápido</span><span><span class="key">L+R+START+SELECT</span> salir</span></div>
+</div>
+
+<div class="screen" id="detail">
+  <div class="hdr">
+    <div class="logo"><b>MMX</b> 3DS</div><div class="rev">v1.0.0</div>
+    <div class="chips"><div class="chip g" id="dchipF">30 FPS</div><div class="chip c" id="dchip3">3D 100%</div></div>
+  </div>
+  <div class="sec" style="top:30px"><div class="title">RENDIMIENTO DETALLADO <span style="color:var(--cyan)">▴</span></div></div>
+  <div class="dcard" id="dcard"></div>
+  <div class="dbtns">
+    <div class="db" id="bf"></div><div class="db" id="bp"></div><div class="db" id="br"></div><div class="db back" id="bk"></div>
+  </div>
+  <div class="foot"><span>Toca <span class="key">VOLVER</span> o la cabecera para regresar</span><span><span class="key">L+R+START+SELECT</span> salir</span></div>
+</div>
+</body></html>

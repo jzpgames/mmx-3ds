@@ -1,0 +1,2068 @@
+#include "mmx_rtl.h"
+#include "mmx_wide_policy.h"
+#include "mmx_renderer.h"
+#include "mmx_zero.h"
+#include "mmx_weapons.h"
+#include "mmx_weapon_combat.h"
+#include "mmx_coop.h"
+#include "mmx_knc_bugfix.h"
+#include "mmx_coop_trace.h"
+#include "mmx_replay.h"
+#include "mmx_coop_view.h"
+#include "mmx_boss_rush.h"
+#include "mmx_boss_rush_audio.h"
+#include "variables.h"
+#include "common_cpu_infra.h"
+#include "snes/snes.h"
+#include "cpu_state.h"
+#include "execution_mode.h"
+#include "funcs.h"
+#include "debug_server.h"
+#include "cpu_trace.h"
+#include "snes/interp_bridge.h"   /* faithful LLE of the $8099 task scheduler */
+#include <setjmp.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "fiber_compat.h"   /* Win32 Fibers on Windows, ucontext shim on POSIX */
+#include "apu_frame_clock.h"
+
+#ifndef MMX_VARIANT_JP
+#define MMX_VARIANT_JP 0
+#endif
+
+/* The ROM streams graphics through $8121 every 256 output bytes. On the
+ * console a mid-task NMI makes that checkpoint yield; this frame-model host
+ * delivers NMI before the scheduler, so its flag stays clear during the task.
+ * Reserve enough time for another worst-case 256-byte literal batch plus its
+ * coroutine epilogue instead of decompressing the whole file in one tick.
+ * This origin is transient: every RtlRunFrame (including replay) renews it. */
+static uint64_t s_graphics_frame_start;
+static bool s_graphics_frame_active;
+
+bool MmxGraphicsShouldYield(const CpuState *cpu) {
+#if MMX_VARIANT_JP
+  (void)cpu;
+  return false; /* Checkpoint addresses below are verified against USA. */
+#else
+  const uint64_t reserve = 0x18000; /* 256 bytes * <=48 slow-bus CPU cycles. */
+  return s_graphics_frame_active && g_snes->nmiEnabled &&
+      !PPU_forcedBlank(g_ppu) && cpu->master_cycles >= s_graphics_frame_start &&
+      cpu->master_cycles - s_graphics_frame_start >=
+          RTL_MASTER_CYCLES_PER_FRAME - reserve;
+#endif
+}
+
+static void MmxGraphicsYieldHook(CpuState *cpu, uint32_t pc) {
+  if (MmxGraphicsShouldYield(cpu))
+    /* $8127 saves the live coroutine, delays it one tick, and returns to the
+     * scheduler's frame wait. Leave $0B9D alone; no synthetic extra NMI. */
+    interp_bridge_pre_opcode_redirect((pc & 0xff0000) | 0x8127);
+}
+
+static SnesrecompExecutionMode mmx_execution_mode(void) {
+#if defined(__3DS__)
+  /* The 3DS host uses the upstream fiber-free scheduler. Task bodies still
+   * bounce to generated native C; only the guest task switch is interpreted. */
+  return SNESRECOMP_EXECUTION_MODE_LLE;
+#else
+  /* LLE is the correctness floor. The C-host fiber scheduler remains an
+   * explicit optimization selected with SNESRECOMP_EXECUTION_MODE=hle. */
+  return snesrecomp_execution_mode(SNESRECOMP_EXECUTION_MODE_LLE);
+#endif
+}
+
+/* C-host implementation of the MMX cooperative task scheduler at
+ * $00:8099. Replaces the asm dispatch loop with a C function that:
+ *   - walks the 7 task slots ($30/40/50/60/70/80/90) once per host
+ *     frame;
+ *   - for state-1 slots: marks state=3, sets cpu->S to the slot's
+ *     entry-S value at $36/$37, and calls the task's entry PC
+ *     (looked up against the cfg-named function table);
+ *   - for state-2 slots: decrements countdown at $31; on zero, marks
+ *     state=3 and re-enters the task via its entry PC (restart-from-
+ *     entry semantics; the task's own progress flag at $7E:FFFF
+ *     drives forward progress across restarts).
+ *
+ * Yields ($00:8100 / $810C) longjmp back via g_mmx_task_jmp into
+ * the per-slot setjmp below. */
+jmp_buf g_mmx_task_jmp;             /* legacy — kept for build compat */
+uint8_t g_mmx_task_slot_x;
+uint8_t g_mmx_task_yield_countdown;
+
+static int mmx_rtl_diag_enabled(void);
+
+/* Dispatch a cooperative task by its 16-bit entry PC (from RAM $0032+slot).
+ * The optional HLE scheduler uses the same authoritative runtime dispatch as
+ * LLE for both ROM variants. An exact AOT body is an optimization; an absent
+ * body executes the real ROM through the interpreter tier. A separate table
+ * of generated C symbols would make HLE dictate what must be compiled. */
+static RecompReturn mmx_dispatch_task_pc(CpuState *cpu, uint16_t pc) {
+  return cpu_dispatch_call_pc(cpu, (uint32_t)pc, 0xFFFFFFu);
+}
+
+/* ── Host-fiber-based cooperative scheduler ──────────────────────────
+ *
+ * The asm cooperative scheduler at $00:8099 uses 65816 TCS+RTS tricks
+ * to save/restore each task's CPU state at yield points. The recomp'd
+ * task bodies are normal C functions — when YieldOneFrame longjmps
+ * out, the host C stack is destroyed and the next dispatch restarts
+ * the task from entry, which loses progress.
+ *
+ * Solution: each task slot runs on its own Windows fiber. The host
+ * C stack is preserved per fiber, so yielding (SwitchToFiber back to
+ * the scheduler) and later resuming (SwitchToFiber back to the slot)
+ * picks up exactly after the yield call site in the recompiled body.
+ *
+ * Lifecycle: a fiber is born the first time a slot dispatches at a
+ * given (pc, slot) pair. It dies when the recompiled body RTSes back
+ * through the fiber-entry thunk; the thunk then marks the slot empty
+ * and switches back to the scheduler.
+ *
+ * Mid-fiber the recomp'd body may install OTHER tasks (via the asm
+ * $813B installer, which runs as ordinary recompiled C). Those new
+ * slots get their own fiber on first scheduler iteration. */
+#define MMX_NSLOTS 7
+
+static void *g_scheduler_fiber = NULL;
+static void *g_slot_fiber[MMX_NSLOTS] = {0};
+static uint16_t g_slot_fiber_pc[MMX_NSLOTS] = {0};
+static uint8_t g_slot_prev_state[MMX_NSLOTS] = {0};
+static uint8_t g_slot_done[MMX_NSLOTS] = {0};
+static uint8_t g_slot_yield_cd[MMX_NSLOTS] = {0};
+/* Saved CpuState per slot. The C-host fiber preserves the C stack but
+ * g_cpu is global — NMI/IRQ/other tasks mutate cpu->m_flag, cpu->x_flag,
+ * cpu->A, cpu->X, cpu->Y, cpu->DB, cpu->D, cpu->P, etc. between
+ * SwitchToFibers. Without per-slot save/restore, a task that yielded
+ * with (m=1, x=1) resumes seeing whatever the LAST runner left
+ * (typically m=0, x=0 from NMI's REP #$38 entry), and runtime-flag-
+ * gated code (DEX width, push/pop width, branch widths) executes with
+ * WRONG widths. Concrete bite: Task0's $8A4F OAM-Y init loop expected
+ * x=1 (64 iterations writing $E0 to $0701/$0801 only) but ran with x=0
+ * (16K iterations wrapping through all of WRAM, corrupting DP $39 to
+ * $E0 and breaking the $8C64 state machine that reads it).
+ *
+ * `saved` is set on first save; before that the slot's CpuState is
+ * uninitialised and entry-S is seeded from asm $86:8067 table at
+ * first dispatch. */
+typedef struct MmxSlotCpuSave {
+    uint8_t  saved;
+    uint16_t A, X, Y, S, D;
+    uint8_t  DB, PB, P;
+    uint8_t  m_flag, x_flag, emulation;
+    uint8_t  _flag_N, _flag_V, _flag_Z, _flag_C, _flag_I, _flag_D;
+} MmxSlotCpuSave;
+
+static MmxSlotCpuSave g_slot_saved_state[MMX_NSLOTS] = {0};
+static MmxSlotCpuSave g_saved_scheduler_state = {0};
+static uint8_t g_current_slot_idx = 0xFF;
+
+/* ── Serializable task resume contexts (save states that survive loading
+ * from any game mode / a fresh process) ─────────────────────────────────
+ *
+ * A yielded task's live resume point is its fiber's host C stack — not
+ * serializable. But the guest-visible equivalent IS: the yield's popped
+ * JSR return frame names the exact guest continuation PC, and the task's
+ * registers at resume are the yield-time CpuState with that frame
+ * consumed. mmx_host_yield records both on every standard yield (cheap);
+ * the .sav v5 game chunk persists them; on load the fibers are torn down
+ * and each occupied slot gets a fresh fiber that resumes its task at the
+ * recorded guest PC under the interp bridge (calls — including the yield
+ * HLEs — bounce to compiled bodies via the paired ABI, so the task runs
+ * mostly compiled again after one interpreted function tail). */
+typedef struct MmxSlotResume {
+  uint8_t  valid;      /* pc/cpu describe a resumable standard-yield suspension */
+  uint8_t  pb;         /* resume bank */
+  uint16_t pc;         /* resume guest PC (the popped frame's continuation) */
+  uint16_t base_s;     /* task base stack (entry-S) — the top-level-RTS watermark */
+  MmxSlotCpuSave cpu;  /* registers at resume; S already past the popped frame */
+} MmxSlotResume;
+static MmxSlotResume g_slot_resume[MMX_NSLOTS];
+static uint16_t g_slot_base_s[MMX_NSLOTS];          /* entry-S, latched at seed */
+static uint8_t  g_slot_resume_pending[MMX_NSLOTS];  /* set by state load */
+static MmxWideSpawnCursor s_ws_spawn_cursor;
+static uint8_t s_ws_spawn_cursor_stage = 0xff;
+/* Yields reached through the non-standard HLE paths (scheduler-dispatch
+ * $80E6) have no popped-frame contract; they clear the slot's resume info
+ * instead of capturing a bogus one. Non-static: gen_stubs.c's HLE bodies
+ * clear it before calling mmx_host_yield. */
+uint8_t g_yield_captures_resume = 1;
+
+static int mmx_rtl_diag_enabled(void) {
+  static int s_init = 0;
+  static int s_enabled = 0;
+  if (!s_init) {
+    const char *v = getenv("MMX_RTL_DIAG");
+    s_enabled = (v && v[0] && v[0] != '0');
+    s_init = 1;
+  }
+  return s_enabled;
+}
+
+static inline uint16_t mmx_slot_handler_from_ram(uint8_t x) {
+    return (uint16_t)g_ram[(0x32 + x) & 0xFFFF]
+         | ((uint16_t)g_ram[(0x33 + x) & 0xFFFF] << 8);
+}
+
+static inline void mmx_save_cpu(MmxSlotCpuSave *s, const CpuState *c) {
+    s->A = c->A; s->X = c->X; s->Y = c->Y; s->S = c->S; s->D = c->D;
+    s->DB = c->DB; s->PB = c->PB; s->P = c->P;
+    s->m_flag = c->m_flag; s->x_flag = c->x_flag;
+    s->emulation = c->emulation;
+    s->_flag_N = c->_flag_N; s->_flag_V = c->_flag_V;
+    s->_flag_Z = c->_flag_Z; s->_flag_C = c->_flag_C;
+    s->_flag_I = c->_flag_I; s->_flag_D = c->_flag_D;
+    s->saved = 1;
+}
+static inline void mmx_restore_cpu(CpuState *c, const MmxSlotCpuSave *s) {
+    c->A = s->A; c->X = s->X; c->Y = s->Y; c->S = s->S; c->D = s->D;
+    c->DB = s->DB; c->PB = s->PB; c->P = s->P;
+    c->m_flag = s->m_flag; c->x_flag = s->x_flag;
+    c->emulation = s->emulation;
+    c->_flag_N = s->_flag_N; c->_flag_V = s->_flag_V;
+    c->_flag_Z = s->_flag_Z; c->_flag_C = s->_flag_C;
+    c->_flag_I = s->_flag_I; c->_flag_D = s->_flag_D;
+}
+
+extern const char *g_last_recomp_func;
+extern int snes_frame_counter;
+#if SNESRECOMP_TRACE
+extern uint8_t g_boundary_frozen;
+extern StackDriftTripwire g_stack_drift_tripwire;  /* declared in cpu_trace.h (already included) */
+#endif
+
+static void CALLBACK mmx_fiber_entry(void *param) {
+  uint8_t slot_idx = (uint8_t)(uintptr_t)param;
+  uint16_t pc = g_slot_fiber_pc[slot_idx];
+  /* Run the recomp'd task body to completion. The body MUST yield via
+   * HleMmxYieldOneFrame/HleMmxYieldNFrames (which SwitchToFiber back
+   * to the scheduler); when it ultimately RTSes here, the task is
+   * done and the slot becomes empty. */
+  g_mmx_task_slot_x = (uint8_t)(slot_idx << 4);
+  mmx_dispatch_task_pc(&g_cpu, pc);
+  /* Body returned: task is finished. Diagnostic: log the death so we
+   * can correlate which task PC died at which frame and what the last
+   * recompiled function on the stack was. Freeze both rings ONCE for
+   * slot 0 so we can inspect the call path leading up to Task0's
+   * unexpected return — the trace freeze is auto-triggered via the
+   * stack-drift mechanism (which also freezes cpu_trace via
+   * capture()'s check). */
+  if (mmx_rtl_diag_enabled()) {
+    fprintf(stderr, "[fiber_die] frame=%d slot=%u pc=$%04X last_func=%s A=$%04X X=$%04X Y=$%04X S=$%04X D=$%04X DB=$%02X PB=$%02X m=%d x=%d\n",
+            snes_frame_counter, slot_idx, pc,
+            g_last_recomp_func ? g_last_recomp_func : "?",
+            g_cpu.A, g_cpu.X, g_cpu.Y, g_cpu.S, g_cpu.D,
+            g_cpu.DB, g_cpu.PB, g_cpu.m_flag, g_cpu.x_flag);
+    fflush(stderr);
+  }
+#if SNESRECOMP_TRACE
+  if (mmx_rtl_diag_enabled() && slot_idx == 0 && !g_stack_drift_tripwire.triggered) {
+    g_stack_drift_tripwire.triggered = 1;  /* freezes cpu_trace */
+    g_boundary_frozen = 1;                 /* freezes boundary ring */
+    fprintf(stderr, "[fiber_die] froze rings for inspection\n");
+    fflush(stderr);
+  }
+#endif
+  /* Mark slot empty, then bounce back to the scheduler. The scheduler
+   * will see g_slot_done and destroy the fiber. */
+  g_slot_done[slot_idx] = 1;
+  for (;;) {
+    SwitchToFiber(g_scheduler_fiber);
+  }
+}
+
+/* Resume-after-load fiber entry: the slot's task was suspended at a standard
+ * yield when the state was saved. Its registers (with the yield frame already
+ * consumed) were restored into g_slot_saved_state by the load hook, so the
+ * scheduler's dispatch path has already installed them into g_cpu. Run the
+ * task tail from the recorded guest PC under the interp bridge: calls bounce
+ * to compiled bodies (the yield HLEs among them — those suspend this fiber
+ * exactly like the compiled path), the task-die/scheduler-dispatch JMP
+ * targets are stop-intercepted, and a top-level RTS past base_s ends the
+ * task. From the scheduler's point of view this fiber is indistinguishable
+ * from one that ran compiled all along. */
+static void CALLBACK mmx_fiber_resume_entry(void *param) {
+  uint8_t slot_idx = (uint8_t)(uintptr_t)param;
+  MmxSlotResume r = g_slot_resume[slot_idx];   /* copy: live struct keeps updating */
+  g_slot_resume_pending[slot_idx] = 0;
+  g_mmx_task_slot_x = (uint8_t)(slot_idx << 4);
+  if (mmx_rtl_diag_enabled()) {
+    fprintf(stderr, "[fiber_resume] frame=%d slot=%u pc=$%02X:%04X base_s=$%04X S=$%04X\n",
+            snes_frame_counter, slot_idx, r.pb, r.pc, r.base_s, g_cpu.S);
+    fflush(stderr);
+  }
+  static const uint32_t k_stop_pcs[] = { 0x0080F8u, 0x0080E6u, 0x008099u };
+  int ok = interp_bridge_resume_task(&g_cpu,
+                                     ((uint32_t)r.pb << 16) | r.pc,
+                                     r.base_s, k_stop_pcs, 3);
+  if (!ok && mmx_rtl_diag_enabled()) {
+    fprintf(stderr, "[fiber_resume] slot=%u interp BAIL (step cap)\n", slot_idx);
+    fflush(stderr);
+  }
+  /* Task frame ended (top-level RTS, stop-PC HLE, or contained bail):
+   * same epilogue as mmx_fiber_entry. */
+  g_slot_done[slot_idx] = 1;
+  for (;;) {
+    SwitchToFiber(g_scheduler_fiber);
+  }
+}
+
+void mmx_host_yield(uint8_t countdown) {
+  /* Called from HleMmxYield* (via gen_stubs.c). We're inside a slot
+   * fiber. Save the full CpuState before SwitchToFiber so the scheduler
+   * (and other tasks / NMI / IRQ) can mutate g_cpu freely without
+   * trampling this slot's emulated 65816 state. Restore on resume. */
+  uint8_t slot_idx = g_current_slot_idx;
+  uint8_t x = (uint8_t)(slot_idx << 4);
+  g_ram[(0x30 + x) & 0xFFFF] = 0x02;
+  g_ram[(0x31 + x) & 0xFFFF] = countdown;
+  g_slot_yield_cd[slot_idx] = countdown;
+  mmx_save_cpu(&g_slot_saved_state[slot_idx], &g_cpu);
+  /* Record the serializable resume context (see MmxSlotResume). The JSR (or
+   * tail-inherited) return frame sits on the guest stack at S+1/S+2; the
+   * resume continuation is frame+1, with the frame consumed (the HLE pops
+   * S+2 after SwitchToFiber returns, modeling the hardware resume RTS). */
+  if (g_yield_captures_resume) {
+    MmxSlotResume *r = &g_slot_resume[slot_idx];
+    uint16_t s = g_cpu.S;
+    uint8_t lo = g_ram[(uint16_t)(s + 1) & 0x1FFF];
+    uint8_t hi = g_ram[(uint16_t)(s + 2) & 0x1FFF];
+    r->pc = (uint16_t)(((((uint16_t)hi << 8) | lo) + 1) & 0xFFFF);
+    r->pb = g_cpu.PB;
+    r->base_s = g_slot_base_s[slot_idx];
+    r->cpu = g_slot_saved_state[slot_idx];
+    r->cpu.S = (uint16_t)(s + 2);
+    r->valid = 1;
+  } else {
+    g_slot_resume[slot_idx].valid = 0;
+  }
+  g_yield_captures_resume = 1;
+#if SNESRECOMP_TRACE
+  /* DIAG: track slot-0 yield-time cpu->S across frames. A persistent
+   * downward drift = a per-frame stack leak in slot-0's foreground run
+   * (the in-stage heavy-load softlock root). Freeze the boundary ring at
+   * the first CLEAN drift onset (S still high in page 1) so the leaking
+   * frame's complete events are captured for offline analysis. */
+  if (slot_idx == 0 && mmx_rtl_diag_enabled()) {
+    static uint16_t s_prev_s0 = 0; static int s_prev_frame = -1;
+    if (s_prev_frame >= 0 && g_cpu.S != s_prev_s0) {
+      int dd = (int)g_cpu.S - (int)s_prev_s0;
+      fprintf(stderr, "[s0drift] frame=%d S=$%04X prevS=$%04X d=%+d\n",
+              snes_frame_counter, g_cpu.S, s_prev_s0, dd);
+      fflush(stderr);
+      if (dd < 0 && g_cpu.S > 0x0150 && !g_boundary_frozen) {
+        g_boundary_frozen = 1;
+        fprintf(stderr, "[s0drift] froze boundary ring at clean drift onset (frame %d)\n",
+                snes_frame_counter);
+        fflush(stderr);
+      }
+    }
+    s_prev_s0 = g_cpu.S; s_prev_frame = snes_frame_counter;
+  }
+#endif
+  SwitchToFiber(g_scheduler_fiber);
+  /* Resume: restore the full CpuState for this slot. */
+  mmx_restore_cpu(&g_cpu, &g_slot_saved_state[slot_idx]);
+}
+
+/* ── .sav v5 game chunk: persist the scheduler's host-side task state ──────
+ * Streamed through the engine's SaveLoadInfo right after the guest blob
+ * (RtlGameInfo.state_save_extra / state_load_extra). On load, the fibers are
+ * torn down and each occupied slot is flagged resume-pending; the next
+ * MmxSchedulerTick rebuilds it with mmx_fiber_resume_entry. */
+#include "snes/saveload.h"
+
+#define MMX_SAV_CHUNK_MAGIC   0x4D4D5854u  /* "MMXT" */
+#define MMX_SAV_CHUNK_VERSION 22u /* per-seat authored camera bounds */
+
+typedef struct MmxSavChunk {
+  uint32_t magic, version;
+  MmxSlotCpuSave main_cpu;              /* g_cpu arch regs at save (main ctx) */
+  uint8_t  occupied[MMX_NSLOTS];        /* fiber existed at save */
+  uint16_t fiber_pc[MMX_NSLOTS];
+  uint8_t  prev_state[MMX_NSLOTS];
+  uint8_t  yield_cd[MMX_NSLOTS];
+  uint16_t base_s[MMX_NSLOTS];
+  MmxSlotCpuSave saved_state[MMX_NSLOTS];
+  MmxSlotResume  resume[MMX_NSLOTS];
+  uint8_t  task_slot_x;
+  /* These fields replace the v1 struct's three bytes of trailing padding, so
+   * the serialized size stays unchanged and existing saves read as valid=0. */
+  uint8_t  ws_wide_cursor_valid;
+  uint16_t ws_wide_cursor;
+} MmxSavChunk;
+
+_Static_assert(sizeof(MmxSavChunk) == 464,
+               "MmxSavChunk save ABI must remain 464 bytes");
+
+static MmxSavChunk g_load_chunk;
+static uint8_t g_load_chunk_ok = 0;
+static bool g_load_complete, g_load_native_streakers;
+static bool g_did_reset, g_first_frame_done;
+static void MmxWideStateSave(struct SaveLoadInfo *sli);
+static void MmxWideStateLoad(struct SaveLoadInfo *sli);
+static void MmxWideStateApply(bool loaded);
+static uint8_t g_load_frame_flags[4];
+static MmxZeroState g_load_zero;
+static MmxWeaponsState g_load_weapons;
+static MmxWeaponCombatState g_load_weapon_combat;
+static MmxCoopState g_load_coop;
+static MmxKncBugfixState g_load_knc_bugfix;
+static MmxCoopViewWorldState g_load_views;
+static MmxCoopViewBoundsState g_load_view_bounds;
+static uint8_t g_load_zero_extension[MMX_ZERO_EXTENSION_STATE_BYTES];
+static MmxBossRushState g_load_rush;
+static MmxBossRushAudioState g_load_rush_audio;
+static MmxBossRushVisualState g_load_rush_visual;
+
+void MmxStateSaveExtra(struct SaveLoadInfo *sli) {
+  MmxSavChunk c;
+  memset(&c, 0, sizeof(c));
+  c.magic = MMX_SAV_CHUNK_MAGIC;
+  c.version = MMX_SAV_CHUNK_VERSION;
+  mmx_save_cpu(&c.main_cpu, &g_cpu);
+  for (int i = 0; i < MMX_NSLOTS; i++) {
+    c.occupied[i]    = (g_slot_fiber[i] != NULL);
+    c.fiber_pc[i]    = g_slot_fiber_pc[i];
+    c.prev_state[i]  = g_slot_prev_state[i];
+    c.yield_cd[i]    = g_slot_yield_cd[i];
+    c.base_s[i]      = g_slot_base_s[i];
+    c.saved_state[i] = g_slot_saved_state[i];
+    c.resume[i]      = g_slot_resume[i];
+  }
+  c.task_slot_x = g_mmx_task_slot_x;
+  c.ws_wide_cursor_valid = s_ws_spawn_cursor.valid ? 1 : 0;
+  c.ws_wide_cursor = s_ws_spawn_cursor.wide;
+  sli->func(sli, &c, sizeof(c));
+  uint8_t flags[4] = {g_did_reset, g_first_frame_done, s_ws_spawn_cursor_stage, 0};
+  sli->func(sli, flags, sizeof(flags));
+  MmxWideStateSave(sli);
+  RtlSaveExecutionState(sli);
+  if (c.version >= 4) {
+    MmxZeroState zero = MmxZeroGetState();
+    sli->func(sli, &zero, c.version >= 15 ? sizeof(zero) : MMX_ZERO_HEALTH_STATE_SIZE);
+  }
+  if (c.version >= 9) {
+    MmxWeaponsState weapons = MmxWeaponsGetState();
+    sli->func(sli, &weapons, sizeof(weapons));
+  }
+  if (c.version >= 10) {
+    MmxWeaponCombatState combat = MmxWeaponsGetCombatState();
+    sli->func(sli, &combat, sizeof(combat));
+  }
+  if (c.version >= 14) {
+    MmxCoopCapture(g_ram);
+    MmxCoopState coop = MmxCoopGetState();
+    sli->func(sli, &coop, sizeof(coop));
+  }
+  if(c.version>=16) {
+    MmxCoopViewWorldState views=MmxCoopViewsGetWorldState();
+    sli->func(sli,&views,sizeof(views));
+  }
+  MmxKncBugfixState knc_bugfix=MmxKncBugfixGetState();
+  sli->func(sli,&knc_bugfix,sizeof(knc_bugfix));
+  uint8_t zero_extension[MMX_ZERO_EXTENSION_STATE_BYTES];
+  MmxZeroExtSaveState(zero_extension);
+  sli->func(sli,zero_extension,sizeof(zero_extension));
+  MmxBossRushState rush=MmxBossRushGetState();
+  sli->func(sli,&rush,sizeof(rush));
+  MmxBossRushAudioState audio=MmxBossRushAudioGetState();
+  sli->func(sli,&audio,sizeof(audio));
+  MmxBossRushVisualState visual=MmxBossRushVisualGetState();
+  sli->func(sli,&visual,sizeof(visual));
+  MmxCoopViewBoundsState bounds=MmxCoopViewsGetBoundsState();
+  sli->func(sli,&bounds,sizeof(bounds));
+}
+
+void MmxStateLoadExtra(struct SaveLoadInfo *sli, uint32_t version) {
+  (void)version;
+  g_load_chunk_ok = 0;
+  g_load_complete = g_load_native_streakers = false;
+  memset(&g_load_zero, 0, sizeof(g_load_zero));
+  memset(&g_load_weapons, 0, sizeof(g_load_weapons));
+  memset(&g_load_weapon_combat, 0, sizeof(g_load_weapon_combat));
+  memset(&g_load_coop, 0, sizeof(g_load_coop));
+  memset(&g_load_knc_bugfix,0,sizeof(g_load_knc_bugfix));
+  memset(&g_load_views,0,sizeof(g_load_views));
+  memset(&g_load_view_bounds,0,sizeof(g_load_view_bounds));
+  memset(g_load_zero_extension,0,sizeof(g_load_zero_extension));
+  memset(&g_load_rush,0,sizeof(g_load_rush));
+  memset(&g_load_rush_audio,0,sizeof(g_load_rush_audio));
+  memset(&g_load_rush_visual,0,sizeof(g_load_rush_visual));
+  memset(&g_load_chunk, 0, sizeof(g_load_chunk));
+  sli->func(sli, &g_load_chunk, sizeof(g_load_chunk));
+  if (g_load_chunk.magic == MMX_SAV_CHUNK_MAGIC &&
+      g_load_chunk.version >= 1 && g_load_chunk.version <= MMX_SAV_CHUNK_VERSION)
+    g_load_chunk_ok = 1;
+  /* The adaptive playtest wrote a 464-byte v2 chunk, while the shared-host
+   * branch used v2 with appended execution/CHR data. Only the latter has a
+   * tail. New saves use v3, making both meanings explicit on load. */
+  size_t remaining = RtlStateBytesRemaining(sli);
+  g_load_complete = g_load_chunk_ok && (g_load_chunk.version >= 3 ||
+      (g_load_chunk.version == 2 && remaining != 0 && remaining != SIZE_MAX));
+  g_load_native_streakers = g_load_chunk_ok && (g_load_chunk.version >= 3 ||
+      (g_load_chunk.version == 2 && remaining == 0));
+  if (g_load_complete) {
+    sli->func(sli, g_load_frame_flags, sizeof(g_load_frame_flags));
+    MmxWideStateLoad(sli);
+    if (!RtlLoadExecutionState(sli)) g_load_chunk_ok = 0;
+    if (g_load_chunk.version >= 4) {
+      size_t zero_size = g_load_chunk.version == 4 ? MMX_ZERO_LEGACY_STATE_SIZE :
+          g_load_chunk.version == 5 ? MMX_ZERO_ANIMATION_STATE_SIZE :
+          g_load_chunk.version == 6 ? MMX_ZERO_COMBAT_STATE_SIZE :
+          g_load_chunk.version == 7 ? MMX_ZERO_SWAP_STATE_SIZE :
+          g_load_chunk.version < 15 ? MMX_ZERO_HEALTH_STATE_SIZE : sizeof(g_load_zero);
+      if (RtlStateBytesRemaining(sli) >= zero_size)
+        sli->func(sli, &g_load_zero, zero_size);
+      else g_load_chunk_ok = 0;
+      if (g_load_chunk.version < 6) {
+        g_load_zero.saber_ready = g_load_zero.combo != 0;
+        if (g_load_zero.slash > 44) g_load_zero.slash = 44;
+      }
+    }
+    if (g_load_chunk.version >= 9) {
+      size_t weapons_size = g_load_chunk.version >= 11 ? sizeof(g_load_weapons) : MMX_WEAPONS_LEGACY_STATE_SIZE;
+      if (RtlStateBytesRemaining(sli) >= weapons_size) {
+        sli->func(sli, &g_load_weapons, weapons_size);
+        if (!MmxWeaponsValidState(&g_load_weapons)) g_load_chunk_ok = 0;
+      } else g_load_chunk_ok = 0;
+    }
+    if (g_load_chunk.version >= 10) {
+      size_t combat_size=g_load_chunk.version>=13 ? sizeof(g_load_weapon_combat) :
+          g_load_chunk.version==12 ? MMX_WEAPON_COMBAT_DAMAGE_SIZE : MMX_WEAPON_COMBAT_LEGACY_SIZE;
+      if (RtlStateBytesRemaining(sli) >= combat_size) {
+        sli->func(sli, &g_load_weapon_combat, combat_size);
+        if (!MmxWeaponsValidCombatState(&g_load_weapon_combat)) g_load_chunk_ok = 0;
+      } else g_load_chunk_ok = 0;
+    }
+  }
+  if (g_load_complete && g_load_chunk.version >= 14) {
+    size_t coop_size = g_load_chunk.version == 14 ? MMX_COOP_LEGACY_STATE_SIZE : sizeof(g_load_coop);
+    if (RtlStateBytesRemaining(sli) >= coop_size) {
+      if (g_load_chunk.version == 14) {
+        uint8_t legacy[MMX_COOP_LEGACY_STATE_SIZE];
+        sli->func(sli, legacy, sizeof(legacy));
+        MmxCoopImportLegacy(&g_load_coop, legacy);
+      } else sli->func(sli, &g_load_coop, sizeof(g_load_coop));
+      if (!MmxCoopValidState(&g_load_coop)) g_load_chunk_ok = 0;
+    } else g_load_chunk_ok = 0;
+  }
+  if(g_load_complete && g_load_chunk.version>=16) {
+    if(RtlStateBytesRemaining(sli)>=sizeof(g_load_views)) {
+      sli->func(sli,&g_load_views,sizeof(g_load_views));
+      if(g_load_views.initialized>1 || g_load_views.stage>12 ||
+          g_load_views.actor_return>2 || g_load_views.contact_player>1) g_load_chunk_ok=0;
+    } else g_load_chunk_ok=0;
+  }
+  if(g_load_complete && g_load_chunk.version>=17) {
+    if(RtlStateBytesRemaining(sli)>=sizeof(g_load_knc_bugfix)) {
+      sli->func(sli,&g_load_knc_bugfix,sizeof(g_load_knc_bugfix));
+      if(!MmxKncBugfixValidState(&g_load_knc_bugfix)) g_load_chunk_ok=0;
+    } else g_load_chunk_ok=0;
+  }
+  if(g_load_complete && g_load_chunk.version>=18) {
+    /* Main shipped v18 with only the Zero extension; the original Rush
+     * previews used v18..20 for Rush/audio/fades without that extension.
+     * Their bounded tail lengths distinguish the two v18 formats. New v21
+     * always stores the extension first, followed by all three Rush states. */
+    size_t rush_bytes=sizeof(g_load_rush)+
+        (g_load_chunk.version>=19?sizeof(g_load_rush_audio):0)+
+        (g_load_chunk.version>=20?sizeof(g_load_rush_visual):0);
+    size_t remaining=RtlStateBytesRemaining(sli);
+    bool extension=g_load_chunk.version>=21 ||
+        (g_load_chunk.version==18 && remaining==sizeof(g_load_zero_extension));
+    bool rush=g_load_chunk.version>=21 || !extension;
+    size_t expected=(extension?sizeof(g_load_zero_extension):0)+(rush?rush_bytes:0)+
+        (g_load_chunk.version>=22?sizeof(g_load_view_bounds):0);
+    if(remaining!=expected) g_load_chunk_ok=0;
+    if(g_load_chunk_ok && extension)
+      sli->func(sli,g_load_zero_extension,sizeof(g_load_zero_extension));
+    if(g_load_chunk_ok && rush) {
+      sli->func(sli,&g_load_rush,sizeof(g_load_rush));
+      if(!MmxBossRushValidState(&g_load_rush)) g_load_chunk_ok=0;
+    }
+    if(g_load_chunk_ok && rush && g_load_chunk.version>=19) {
+      sli->func(sli,&g_load_rush_audio,sizeof(g_load_rush_audio));
+      if(!MmxBossRushAudioValidState(&g_load_rush_audio)) g_load_chunk_ok=0;
+    }
+    if(g_load_chunk_ok && rush && g_load_chunk.version>=20) {
+      sli->func(sli,&g_load_rush_visual,sizeof(g_load_rush_visual));
+      if(!MmxBossRushVisualValidState(&g_load_rush_visual)) g_load_chunk_ok=0;
+    }
+    if(g_load_chunk_ok && g_load_chunk.version>=22) {
+      sli->func(sli,&g_load_view_bounds,sizeof(g_load_view_bounds));
+      if(!MmxCoopViewsValidBoundsState(&g_load_view_bounds)) g_load_chunk_ok=0;
+    }
+  }
+  if(g_load_complete && g_load_chunk.version<16)
+    g_load_views.contact_player=g_load_coop.anchor;
+  if (!g_load_chunk_ok)
+    fprintf(stderr, "[mmx_state] load: bad game chunk (magic=%08x ver=%u)\n",
+            g_load_chunk.magic, g_load_chunk.version);
+}
+
+static bool s_ws_recover_armor;
+static int MmxWsMargin(void);
+void MmxOnStateLoaded(uint32_t version) {
+  MmxReplayStateLoaded();
+  MmxRendererReset();
+  if(g_load_chunk_ok && g_load_complete) MmxBossRushSetState(&g_load_rush);
+  else MmxBossRushReset();
+  MmxBossRushVisualState empty_visual={0};
+  MmxBossRushVisualSetState(g_load_chunk_ok && g_load_complete?&g_load_rush_visual:&empty_visual);
+  MmxBossRushAudioReset();
+  if(g_load_chunk_ok && g_load_complete) MmxBossRushAudioSetState(&g_load_rush_audio);
+  if(!RtlIsRollbackLoad()) MmxBossRushAudioLoaded();
+  MmxKncBugfixSetState(g_load_knc_bugfix);
+  s_ws_recover_armor = g_mmx_custom_renderer && MmxWidePolicy_PrematureRideArmor(g_ram);
+  if (g_mmx_custom_renderer && !g_load_native_streakers) {
+    for (uint16 object = 0xe68; object <= 0x1228; object += 64) {
+      uint16 flag = g_ram[object + 12] | (g_ram[object + 13] << 8);
+      if (flag < 0xfa00 || flag > 0xfffb) continue;
+      uint16 record = g_ram[flag + 3] | (g_ram[flag + 4] << 8);
+      if (record < 0x8000 || record > 0xfff9) continue;
+      const uint8 *event = RomPtr(0x850000u | record);
+      if ((event[0] & 15) == 3 && event[3] == 0x37)
+        MmxWidePolicy_RecoverParkedStreaker(g_ram, object, (event[5] | (event[6] << 8)) & 0x1fff);
+    }
+  }
+  /* Loading before the first frame must not run RESET over the restored guest. */
+  bool complete = g_load_chunk_ok && g_load_complete;
+  g_did_reset = complete ? g_load_frame_flags[0] != 0 : true;
+  g_first_frame_done = complete ? g_load_frame_flags[1] != 0 : true;
+  MmxWideStateApply(complete);
+  MmxZeroSetState(g_load_zero);
+  if (complete) MmxZeroExtLoadState(g_load_zero_extension);
+  MmxWeaponsSetState(g_load_weapons);
+  MmxWeaponsSetCombatState(g_load_weapon_combat);
+  if (complete && g_load_chunk.version >= 14) MmxCoopSetState(&g_load_coop);
+  else MmxCoopReset();
+  MmxCoopViewsSetWorldState(&g_load_views);
+  MmxCoopViewsSetBoundsState(&g_load_view_bounds);
+  MmxCoopTraceStateLoaded();
+  if (version < 5 || !g_load_chunk_ok) {
+    /* Legacy v4 save: no chunk, no rebuild — preserve the historical
+     * behavior exactly (live fibers limp along; loads are only reliable
+     * from a matching game mode). */
+    fprintf(stderr, "[mmx_state] loaded legacy v%u state: fibers NOT rebuilt "
+            "(reliable only from a matching game mode)\n", version);
+    s_ws_spawn_cursor.valid = false;
+    s_ws_spawn_cursor_stage = 0xff;
+    return;
+  }
+  const MmxSavChunk *c = &g_load_chunk;
+  for (int i = 0; i < MMX_NSLOTS; i++) {
+    if (g_slot_fiber[i] != NULL) {
+      DeleteFiber(g_slot_fiber[i]);
+      g_slot_fiber[i] = NULL;
+    }
+    g_slot_done[i]        = 0;
+    g_slot_fiber_pc[i]    = c->fiber_pc[i];
+    g_slot_prev_state[i]  = c->prev_state[i];
+    g_slot_yield_cd[i]    = c->yield_cd[i];
+    g_slot_base_s[i]      = c->base_s[i];
+    g_slot_saved_state[i] = c->saved_state[i];
+    g_slot_resume[i]      = c->resume[i];
+    g_slot_resume_pending[i] = (uint8_t)(c->occupied[i] && c->resume[i].valid);
+    if (c->occupied[i] && !c->resume[i].valid)
+      fprintf(stderr, "[mmx_state] slot %d occupied but no resume ctx — task "
+              "will RESTART at entry $%04X\n", i, c->fiber_pc[i]);
+    /* Resume path: the dispatch installs g_slot_saved_state into g_cpu, so
+     * point it at the resume registers (frame already consumed). */
+    if (g_slot_resume_pending[i]) {
+      g_slot_saved_state[i] = c->resume[i].cpu;
+      g_slot_saved_state[i].saved = 1;
+    }
+  }
+  g_mmx_task_slot_x = c->task_slot_x;
+  s_ws_spawn_cursor.valid = c->ws_wide_cursor_valid != 0;
+  s_ws_spawn_cursor.wide = c->ws_wide_cursor;
+  s_ws_spawn_cursor_stage = complete ? g_load_frame_flags[2] : g_ram[0x1f7a];
+  mmx_restore_cpu(&g_cpu, &c->main_cpu);
+  g_current_slot_idx = 0xFF;
+  if (complete) RtlApplyExecutionState();
+  if (mmx_rtl_diag_enabled()) fprintf(stderr, "[mmx_state] v%u state loaded: fibers rebuilt (%d resume-pending)\n",
+          version,
+          (int)(g_slot_resume_pending[0] + g_slot_resume_pending[1] +
+                g_slot_resume_pending[2] + g_slot_resume_pending[3] +
+                g_slot_resume_pending[4] + g_slot_resume_pending[5] +
+                g_slot_resume_pending[6]));
+}
+
+void MmxSchedulerTick(void) {
+  /* Promote main thread to a fiber on first call. */
+  if (g_scheduler_fiber == NULL) {
+    g_scheduler_fiber = ConvertThreadToFiber(NULL);
+    if (g_scheduler_fiber == NULL) {
+      fprintf(stderr, "[mmx_sched] ConvertThreadToFiber failed gle=%lu\n",
+              GetLastError());
+      abort();
+    }
+  }
+  /* NMI handler has already run; $0B9D is $FF. Bump frame counter. */
+  ++(*(uint8_t*)(g_ram + 0x0B9B));
+  static uint32_t s_tick_n = 0;
+  bool dbg = mmx_rtl_diag_enabled() && (s_tick_n < 8);
+  if (dbg) {
+    fprintf(stderr, "[tick %u] slots: ", s_tick_n);
+    for (uint8_t x = 0x00; x < 0x70; x += 0x10) {
+      uint8_t st = g_ram[(0x30 + x) & 0xFFFF];
+      uint8_t cd = g_ram[(0x31 + x) & 0xFFFF];
+      uint16_t pc = g_ram[(0x32 + x) & 0xFFFF] | ((uint16_t)g_ram[(0x33 + x) & 0xFFFF] << 8);
+      fprintf(stderr, "s%u(st=%u cd=%u pc=$%04X%s) ", x >> 4, st, cd, pc,
+              g_slot_fiber[x >> 4] ? "*" : "");
+    }
+    fprintf(stderr, "\n");
+  }
+  s_tick_n++;
+  /* Ack-clear the NMI handshake flag BEFORE dispatching tasks, modeling
+   * the asm scheduler's `STZ $0B9D` at $00:80C6 which clears it early so
+   * the bulk of each frame's task work runs with $0B9D==0.
+   *
+   * Why this matters for the graphics decompressor (Task B25B / B2EB,
+   * slot 6): its inner loop calls the CONDITIONAL vblank-yield at
+   * $00:8121 (`BIT $0B9D ; BMI yield ; RTS`, HLE'd as YieldVblank) every
+   * 32 decompressed units — "keep working unless an NMI has fired since
+   * we last looked." On hardware $0B9D is set by NMI at vblank, then
+   * STZ'd at $80C6, so the decompressor sees it CLEAR for most of the
+   * frame and only yields when the NEXT vblank's NMI re-sets it — letting
+   * it stream multiple 32-unit batches per frame.
+   *
+   * Previously the C-host cleared $0B9D only at the END of the tick (see
+   * the ack-clear after the slot loop). I_NMI runs before the tick and
+   * sets $0B9D=$FF, so the decompressor saw $FF on its FIRST $8121 check
+   * and yielded after a single 32-unit batch — ~1/3 the hardware
+   * throughput. That delayed every VRAM-streamed object's slot
+   * allocation (e.g. Spark Mandrill's dash-jump turtle allocated its tile
+   * base at cursor+~37f instead of hardware's +~14f, losing the race
+   * against the object's ~+30f activation, so the tile base latched 0 and
+   * the turtle rendered invisible).
+   *
+   * Clearing here preserves that first-batch throughput. The frame-budget
+   * checkpoint in MmxGraphicsShouldYield now supplies the missing mid-tick
+   * boundary: $8121 takes its native coroutine yield before the next batch
+   * would overrun the frame. It does not set $0B9D or inject another NMI.
+   * I_NMI's gated DMA path still observes the same handshake flag. */
+  g_ram[0x0B9D] = 0x00;
+  for (uint8_t x = 0x00; x < 0x70; x += 0x10) {
+    uint8_t slot_idx = x >> 4;
+    g_mmx_task_slot_x = x;
+    g_current_slot_idx = slot_idx;
+    uint8_t state = g_ram[(0x30 + x) & 0xFFFF];
+    if (state == 0x00 || state == 0x03) {  /* empty / running */
+      g_slot_prev_state[slot_idx] = state;
+      continue;
+    }
+    if (state == 0x02) {
+      /* Byte-exact match to the asm scheduler's state-2 handler at $8080B1:
+       *   CMP #$02 ; DEC $31,X ; BEQ resume
+       * i.e. decrement $31 EVERY frame and resume when it reaches 0. The prior
+       * `if (cd > 1) { cd-- }` form resumed on the same frame but left $31 at 1
+       * instead of 0 (never taking the final decrement), so the delay-countdown
+       * byte diverged from the faithful interp-LLE by 1 after every timed yield
+       * (co-sim: the $0031 fork from frame 157). Decrement-then-test matches. */
+      uint8_t cd = (uint8_t)(g_ram[(0x31 + x) & 0xFFFF] - 1);
+      g_ram[(0x31 + x) & 0xFFFF] = cd;
+      if (cd != 0) {
+        g_slot_prev_state[slot_idx] = state;
+        continue;
+      }
+      /* countdown hit zero: fall through to resume */
+    }
+    /* state == 1 (initial) or state == 2 + cd==0 (resume) */
+    bool fresh_install = (state == 0x01 && g_slot_prev_state[slot_idx] != 0x01);
+    uint16_t handler = fresh_install ? mmx_slot_handler_from_ram(x)
+                                     : g_slot_fiber_pc[slot_idx];
+    if (fresh_install) {
+      /* $00:813B just installed this slot. This is the scheduler's
+       * only authoritative read of the handler bytes; between
+       * dispatches MMX reuses $32/$33 as scratch. */
+      if (g_slot_fiber[slot_idx] != NULL) {
+        DeleteFiber(g_slot_fiber[slot_idx]);
+        g_slot_fiber[slot_idx] = NULL;
+      }
+      g_slot_fiber_pc[slot_idx] = handler;
+      g_slot_done[slot_idx] = 0;
+      g_slot_saved_state[slot_idx].saved = 0;
+      g_slot_resume[slot_idx].valid = 0;
+      g_slot_resume_pending[slot_idx] = 0;
+    }
+    if (g_slot_fiber[slot_idx] == NULL) {
+      if (handler == 0) {
+        handler = mmx_slot_handler_from_ram(x);
+        g_slot_fiber_pc[slot_idx] = handler;
+        if (mmx_rtl_diag_enabled()) {
+          fprintf(stderr, "[mmx_sched] slot=%u state=$%02X missing cached handler; using ram pc=$%04X\n",
+                  slot_idx, state, handler);
+          fflush(stderr);
+        }
+      }
+      /* 1 MiB stack per fiber — recomp'd bodies can recurse deeply. A slot
+       * flagged resume-pending (by the state-load hook) gets the interp
+       * resume entry instead of a fresh task start. */
+      int resuming = g_slot_resume_pending[slot_idx] && g_slot_resume[slot_idx].valid;
+      g_slot_fiber[slot_idx] = CreateFiber(
+          1024 * 1024,
+          resuming ? mmx_fiber_resume_entry : mmx_fiber_entry,
+          (void*)(uintptr_t)slot_idx);
+      if (g_slot_fiber[slot_idx] == NULL) {
+        fprintf(stderr, "[mmx_sched] CreateFiber slot=%u failed gle=%lu\n",
+                slot_idx, GetLastError());
+        abort();
+      }
+      if (mmx_rtl_diag_enabled()) {
+        fprintf(stderr, "[fiber_new] frame=%d slot=%u pc=$%04X%s\n",
+                snes_frame_counter, slot_idx, handler,
+                resuming ? " (RESUME)" : "");
+        fflush(stderr);
+      }
+    } else {
+      if (dbg) fprintf(stderr, "  -> RESUME slot=%u pc=$%04X\n",
+                       slot_idx, handler);
+    }
+    g_ram[(0x30 + x) & 0xFFFF] = 0x03;  /* mark running */
+    g_ram[0x00A0] = x;
+    /* Save scheduler's full CpuState, install slot's. On first
+     * dispatch the slot's saved state is uninitialised — seed S from
+     * the asm $86:8067 table ($013F, $017F, $01BF, $01FF, $023F,
+     * $027F, $02BF for slots 0..6) and carry the rest of the current
+     * CpuState forward (ResetHandler's m=1, x=1, DB=$86, PB=$80 etc.
+     * are the post-reset baseline). */
+    mmx_save_cpu(&g_saved_scheduler_state, &g_cpu);
+    if (!g_slot_saved_state[slot_idx].saved) {
+      mmx_save_cpu(&g_slot_saved_state[slot_idx], &g_cpu);
+      g_slot_saved_state[slot_idx].S = (uint16_t)g_ram[(0x36 + x) & 0xFFFF]
+                                     | ((uint16_t)g_ram[(0x37 + x) & 0xFFFF] << 8);
+      /* Latch the task's base stack now: $36/$37 is scheduler scratch between
+       * dispatches, so this is the only authoritative read (mirrors the
+       * handler-PC latch above). The resume machinery uses it as the
+       * top-level-RTS watermark. */
+      g_slot_base_s[slot_idx] = g_slot_saved_state[slot_idx].S;
+    }
+    mmx_restore_cpu(&g_cpu, &g_slot_saved_state[slot_idx]);
+    SwitchToFiber(g_slot_fiber[slot_idx]);
+    /* Slot suspended or done — save its full CpuState, restore
+     * scheduler's. */
+    mmx_save_cpu(&g_slot_saved_state[slot_idx], &g_cpu);
+    mmx_restore_cpu(&g_cpu, &g_saved_scheduler_state);
+    if (g_slot_done[slot_idx]) {
+      DeleteFiber(g_slot_fiber[slot_idx]);
+      g_slot_fiber[slot_idx] = NULL;
+      g_slot_fiber_pc[slot_idx] = 0;
+      g_slot_done[slot_idx] = 0;
+      g_slot_saved_state[slot_idx].saved = 0;
+      g_slot_resume[slot_idx].valid = 0;
+      g_slot_resume_pending[slot_idx] = 0;
+      g_ram[(0x30 + x) & 0xFFFF] = 0x00;
+      if (dbg) fprintf(stderr, "  <- slot=%u DONE\n", slot_idx);
+    } else {
+      if (dbg) fprintf(stderr, "  <- slot=%u yielded cd=%u\n",
+                       slot_idx, g_slot_yield_cd[slot_idx]);
+    }
+    g_slot_prev_state[slot_idx] = g_ram[(0x30 + x) & 0xFFFF];
+  }
+  g_current_slot_idx = 0xFF;
+  /* Ack-clear NMI handshake flags so NMI's gated DMA path runs.
+   *
+   * Asm scheduler at $00:80C6 (and $80CC, slot-6 special) STZs $0B9D
+   * after walking all 7 slots, then JMP $8099 back to the spinlock-
+   * on-$0B9D. NMI sets $0B9D = $FF at $8193-$8195; tasks/IRQ are
+   * expected to clear it before the next NMI's $8188 LDA $0B9D ;
+   * ORA $0BA0 ; BNE $8193 check (which gates the JSR $8822 call) and
+   * its mirror at $83FC LDA $0B9D ; ORA $0BA0 ; BNE $8421 inside the
+   * $83F1 dispatch (which gates JSR $81E3 → CGRAM/OAM DMA + JSR $82C8
+   * → VRAM DMA).
+   *
+   * $0BA0 is the IRQ-side ack flag — NMI also sets it $FF at $8198;
+   * IRQ handler paths $84C6 / $84F5 / $851F STZ $0BA0. But IRQ enable
+   * depends on $4200 = $B1 which is only set by NMI's $8458 path
+   * ($8460 STA $4200) — and $8458 only runs if `$0B9D | $0BA0 == 0`.
+   * Chicken-and-egg: without bootstrap ack-clearing both flags, IRQ
+   * never enables, $0BA0 never clears, NMI's gated DMA never fires,
+   * CGRAM stays empty, and the Capcom logo renders to a black screen.
+   *
+   * Bootstrap both in the C-host scheduler so the NMI/IRQ handshake
+   * gets off the ground. Once IRQ is enabled (via NMI's $8460), the
+   * asm IRQ handler resumes clearing $0BA0 naturally each frame. */
+  g_ram[0x0B9D] = 0x00;
+  g_ram[0x0BA0] = 0x00;
+}
+
+void MmxDrawPpuFrame(void) {
+  SimpleHdma hdma_chans[3];
+
+  Dma *dma = g_dma;
+
+  /* Reinitialize HDMA from the actual $420C value written during NMI.
+   * $7E:0033 is task-slot/sprite scratch in MMX and is not a stable
+   * HDMAEN mirror. */
+  dma_startDma(dma, g_snesrecomp_last_hdmaen, true);
+
+  SimpleHdma_Init(&hdma_chans[0], &dma->channel[5]);
+  SimpleHdma_Init(&hdma_chans[1], &dma->channel[6]);
+  SimpleHdma_Init(&hdma_chans[2], &dma->channel[7]);
+
+  int trigger = g_snes->vIrqEnabled ? g_snes->vTimer + 1 : -1;
+
+  for (int i = 0; i <= 224; i++) {
+    if (g_mmx_custom_renderer) MmxRendererCaptureLine(g_ppu, i);
+    /* Opt-in (3DS): skip native pixels the custom compositor never shows.
+     * HDMA, IRQ and sprite-flag evaluation below are unchanged. */
+    g_ppu_skip_line_pixels = g_mmx_custom_renderer && MmxRendererSkipStockLine(g_ppu, i);
+    ppu_runLine(g_ppu, i);
+    g_ppu_skip_line_pixels = false;
+    SimpleHdma_DoLine(&hdma_chans[0]);
+    SimpleHdma_DoLine(&hdma_chans[1]);
+    SimpleHdma_DoLine(&hdma_chans[2]);
+    //    dma_doHdma(snes->dma);
+    if (i == trigger) {
+      // Simulate hardware IRQ latch: I_IRQ's first instruction reads HW_TIMEUP
+      // ($4211) and branches on the N flag to distinguish timer-IRQ from
+      // other sources. recomp_hw.c's ReadReg(0x4211) returns g_snes->inIrq<<7
+      // and clears the flag; assert it here so the handler takes the
+      // timer-IRQ path instead of exiting immediately.
+      g_snes->inIrq = true;
+      /* Option-1 cpu->S ABI: model the hardware IRQ-entry push so the
+       * handler's RTI has a frame to pop (paired with cpu_state.h's RTI
+       * pop). Without it cpu->S drifts on every interrupt. */
+      cpu_push_interrupt_frame(&g_cpu);
+      I_IRQ(&g_cpu);
+      trigger = g_snes->vIrqEnabled ? g_snes->vTimer + 1 : -1;
+    }
+  }
+}
+
+void RunOneFrameOfGame(void) {
+  RtlSetPadState(0,MmxBossRushFilterInput(RtlGetPadState(0)));
+  s_graphics_frame_start = g_cpu.master_cycles;
+  s_graphics_frame_active = g_did_reset;
+#if !MMX_VARIANT_JP
+  interp_bridge_set_pre_opcode_hook(0x008121, MmxGraphicsYieldHook);
+  if (!MmxCoopEnabled()) {
+    static const uint32_t culls[] = {0x82807d,0x82809e,0x8280c3,0x838957};
+    for (unsigned i=0;i<sizeof(culls)/sizeof(culls[0]);++i)
+      interp_bridge_set_pre_opcode_hook(culls[i],MmxWsCullHook);
+  }
+#endif
+  // First-call reset gate. Was previously `if (*(uint16*)$7F8000 == 0) I_RESET()`,
+  // which silently relied on WRAM being zero-initialized at power-on. Real hardware
+  // (and snes9x) power-on WRAM is 0x55, so that check would never fire and I_RESET
+  // would be skipped, leaving $0100 (GameMode) at 0x55 — out-of-bounds for the
+  // 42-entry dispatch table at PC 0x009329. Use a host-side bool instead so the
+  // gate is independent of WRAM contents.
+  if (!g_did_reset) {
+    cpu_state_init(&g_cpu, g_ram);
+    cpu_trace_px_breadcrumb(&g_cpu, 0x1000, "after_cpu_state_init");
+    I_RESET(&g_cpu);
+    cpu_trace_px_breadcrumb(&g_cpu, 0x1001, "after_I_RESET");
+    g_did_reset = true;
+  }
+  cpu_trace_px_breadcrumb(&g_cpu, 0x2000, "before_NMI_or_Internal");
+  // NMI handler runs BEFORE the main-loop game code each frame.
+  //
+  // On real hardware NMI fires at vblank start (between frames).
+  // Its handler polls HW_JOY ($4218/$4219) into the $15-$18 mirror;
+  // the next frame's game logic reads that mirror. Demo inputs are
+  // applied INSIDE the main loop by overwriting $15/$16; if NMI's
+  // poll runs LAST it clobbers the demo bytes with the empty
+  // controller state ($00) and the end-of-frame mirror reads as 0.
+  //
+  // Per snes9x oracle trace at GM=07: emu's per-frame writer order
+  // is poll($86B2/$86C1) → DamagePlayer($F62F/$F631) → GameMode07
+  // demo-override($9C93/$9C9C); demo bytes are LAST and stick. With
+  // recomp's prior `Internal(); auto_00_816A()` order, PollJoypad
+  // ran last instead, leaving $15/$16=$00. End-of-frame snapshot
+  // diverges from oracle, and demo timing skews because the
+  // VariousPromptTimer / TitleInputIndex tick keys off observable
+  // input state.
+  //
+  // Frame 0 is special: real hardware fires the first NMI AFTER
+  // I_RESET completes AND the main loop has had time to set up flags
+  // (notably SEP #$10 → x=1). If we run I_NMI before Internal on the
+  // very first frame, I_NMI's PHP captures I_RESET-end's P (x=0); its
+  // RTI then restores x=0 to the main loop. Subsequent ProcessGameMode
+  // → UploadGraphicsFiles_Layer3 → TAY at $00:A9A5 then runs as 16-bit,
+  // copying A's polluted high byte into Y, indexing past the GFX bank
+  // table and writing $7E (instead of $0B) to $7E:008C. Skip I_NMI on
+  // frame 0 so the order matches hardware: I_RESET → main loop →
+  // (vblank) → I_NMI → main loop → ...
+  // Assert NMI-pending so the recompiled NMI handler's read of $4210
+  // (RDNMI) returns bit 7 = 1, matching real hardware. snes_readReg
+  // clears the latch on read.
+  if (g_first_frame_done) {
+    static int s_diag_frames = 0;
+    if (mmx_rtl_diag_enabled() && s_diag_frames < 5) {
+      fprintf(stderr, "  [pre-NMI ] slot0 state=$%02X cd=$%02X pc=$%02X%02X\n",
+              g_ram[0x30], g_ram[0x31], g_ram[0x33], g_ram[0x32]);
+    }
+#if SNESRECOMP_TRACE
+    /* OAM-dropout detector (task #7): count on-screen sprites in the OAM
+     * shadow ($0700 low table; Y is byte 1 of each 4-byte entry, off-screen
+     * park = $E0). The transient dropout = sustained gameplay -> sudden
+     * collapse to ~0 -> RECOVERY within a few frames. That recovery is what
+     * distinguishes it from a scene transition (which stays low / changes
+     * scene). Freeze the boundary ring only on a confirmed transient
+     * collapse-then-recover, so the object-engine perturbation that built the
+     * empty OAM (a frame or two before the collapse) is captured. */
+    if (mmx_rtl_diag_enabled() && !g_boundary_frozen && snes_frame_counter > 1500) {
+      static int s_prev = -1;       /* on-screen count last frame */
+      static int s_drop_frame = -1; /* frame the collapse began (-1 = idle) */
+      static int s_drop_prev = 0;   /* on-screen count just before collapse */
+      int onscreen = 0;
+      for (int i = 0; i < 128; i++)
+        if (g_ram[(0x0700 + i * 4 + 1) & 0x1FFFF] < 0xE0) onscreen++;
+      /* Snapshot the OAM-build gate vars so we can diff dropout vs normal:
+       * $1F11 = OAM-build mode (JMP ($D7D8,X) index), $0BCF = build flag,
+       * $1F9A = sprite limit, $E4/$E5 = build counters. */
+      #define OAMDBG_VARS snes_frame_counter, onscreen, \
+        g_ram[0x1F11], g_ram[0x0BCF], g_ram[0x1F9A], g_ram[0x00E4], g_ram[0x00E5]
+      if (s_drop_frame < 0) {
+        if (s_prev >= 70 && s_prev <= 128 && onscreen <= 8) {
+          s_drop_frame = snes_frame_counter; s_drop_prev = s_prev;
+          fprintf(stderr, "[oamvar] PRE  f=%d on=%d 1F11=%02X 0BCF=%02X 1F9A=%02X E4=%02X E5=%02X\n", OAMDBG_VARS);
+          /* Dump the 128 OAM Y bytes so we see WHICH slots parked (X/HUD-
+           * specific = low slots vs pool-overflow = high slots). */
+          fprintf(stderr, "[oamY] DROP f=%d:", snes_frame_counter);
+          for (int i = 0; i < 128; i++)
+            fprintf(stderr, "%02X", g_ram[(0x0700 + i * 4 + 1) & 0x1FFFF]);
+          fprintf(stderr, "\n");
+          fflush(stderr);
+        }
+      } else if (onscreen >= 12) {
+        fprintf(stderr, "[oamY] REC  f=%d:", snes_frame_counter);
+        for (int i = 0; i < 128; i++)
+          fprintf(stderr, "%02X", g_ram[(0x0700 + i * 4 + 1) & 0x1FFFF]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[oamvar] REC  f=%d on=%d 1F11=%02X 0BCF=%02X 1F9A=%02X E4=%02X E5=%02X\n", OAMDBG_VARS);
+        fprintf(stderr, "[oamdrop] TRANSIENT collapse@%d (%d->~0) recovered@%d ; froze ring\n",
+                s_drop_frame, s_drop_prev, snes_frame_counter);
+        fflush(stderr);
+        g_boundary_frozen = 1;
+      } else {
+        fprintf(stderr, "[oamvar] DROP f=%d on=%d 1F11=%02X 0BCF=%02X 1F9A=%02X E4=%02X E5=%02X\n", OAMDBG_VARS);
+        fflush(stderr);
+        if (snes_frame_counter - s_drop_frame > 12) s_drop_frame = -1;
+      }
+      s_prev = onscreen;
+    }
+#endif
+    g_snes->inNmi = true;
+    /* Option-1 cpu->S ABI: model the hardware NMI-entry push so the
+     * handler's RTI has a frame to pop (paired with cpu_state.h's RTI
+     * pop). Without it cpu->S drifts on every interrupt. */
+    cpu_push_interrupt_frame(&g_cpu);
+    I_NMI(&g_cpu);
+    cpu_trace_px_breadcrumb(&g_cpu, 0x2001, "after_I_NMI");
+    if (mmx_rtl_diag_enabled() && s_diag_frames < 5) {
+      fprintf(stderr, "  [post-NMI] slot0 state=$%02X cd=$%02X pc=$%02X%02X\n",
+              g_ram[0x30], g_ram[0x31], g_ram[0x33], g_ram[0x32]);
+      s_diag_frames++;
+    }
+  }
+  cpu_trace_px_breadcrumb(&g_cpu, 0x2002, "before_Internal");
+  MmxBossRushFrame(g_ram,RtlGetPadState(0));
+  if(MmxBossRushGetState().mode==MMX_RUSH_FINISHED) return;
+  MmxKncBugfixTick(g_ram,RtlGetPadState(0),RtlGetPadState(1));
+  if (MmxCoopEnabled()) MmxCoopPoll(RtlGetPadState(0), RtlGetPadState(1));
+  else if (MmxZeroSwapTick(g_ram)) return;
+  if (MmxCoopEnabled() ? MmxCoopFrameTick(g_ram) : MmxWeaponsFrameTick(g_ram)) {
+    MmxCoopDiagnosticFrame(g_ram);return;
+  }
+  if (s_ws_recover_armor) {
+    if (!g_mmx_custom_renderer || !MmxWidePolicy_PrematureRideArmor(g_ram) ||
+        MmxWidePolicy_RecoverRideArmor(g_ram, MmxWsMargin())) s_ws_recover_armor = false;
+  }
+  /* Rearm the P.X tripwire here so the first x=1→0 transition INSIDE
+   * Internal() (the main game loop) is captured fresh. The earlier
+   * boot-time REP #$38 in I_RESET is expected and intentional; we only
+   * want to know where x flips during ProcessGameMode dispatch. */
+  /* Drive one frame of the cooperative task scheduler. NMI already
+   * set $0B9D=$FF; the asm spinlock at $80A1 would short-circuit
+   * but we skip it entirely because MmxSchedulerTick is the C
+   * replacement for the entire $8099 main loop. */
+  cpu_trace_arm_px_tripwire();
+  waiting_for_vblank = 0xFF;
+  /* Swappable scheduler tier. Faithful LLE: run the real $00:8099
+   * cooperative task scheduler under interp816, yielding after one slot
+   * walk when it reaches the $8080A1 vblank-spin with $0B9D cleared. The
+   * interpreter handles the infinite loop, coroutine stack switching, and
+   * JMP ($0032,X) dispatch by construction; dispatched tasks bounce to compiled
+   * bodies via the paired ABI (and not-yet-compiled task bodies run interpreted
+   * via the tier-2 gap manifest) — so it needs NO per-variant task-PC table.
+   * I_NMI already set $0B9D=$FF so the spin falls through on entry. See docs /
+   * co-sim: fixes NMI/IRQ-timing guest-state drift the HLE approximates
+   * (scheduler slot $0031, DMA bookkeeping $02EE/$02FA).
+   *
+   * Both regions default to LLE through the shared execution-mode policy.
+   * SNESRECOMP_EXECUTION_MODE=hle explicitly selects the legacy C-host path.
+   *
+   * ── HLE IS DEPRECATED (2026-07-02) ───────────────────────────────────────
+   * The C-host HLE scheduler (MmxSchedulerTick + the hardcoded mmx_dispatch_
+   * task_pc task table) is DEPRECATED and slated for removal; LLE is the path
+   * forward. Rationale:
+   *   - LLE needs NO per-variant task table (HLE's table is hand-derived per
+   *     game/region — the maintenance burden that killed HLE-on-JP: JP's task
+   *     PCs shift ~2 bytes from USA, and even with a reverse-derived table the
+   *     fiber coroutine lifecycle broke + compiling the tasks garbled video).
+   *   - LLE's only cost is interpreting the tiny $8099 loop each frame (task
+   *     BODIES still run compiled via bounce) — a negligible perf delta.
+   * Support status: HLE is deprecated and unsupported on JP. Do not invest
+   * further in the HLE path unless it becomes a checked LLE optimization. */
+  {
+    if (mmx_execution_mode() == SNESRECOMP_EXECUTION_MODE_LLE)
+      interp_bridge_run_scheduler(&g_cpu, 0x808099, 0x8080A1, 0x0B9D);
+    else
+      MmxSchedulerTick();
+  }
+  cpu_trace_px_breadcrumb(&g_cpu, 0x2003, "after_Internal");
+  MmxZeroHealthSync(g_ram);
+  MmxCoopLiftCarry(g_ram);
+  MmxCoopSyncPriority(g_ram);
+  MmxCoopCapture(g_ram);
+  MmxBossRushAfterFrame(g_ram);
+  MmxCoopTraceFrame(g_ram);
+  /* Out of play (death, level setup, arrival) the widened spawn cursor is
+   * stale; drop it even when no scan runs before play resumes. */
+  if (!MmxWidePolicy_WideSpawnCursorPersists(g_ram))
+    s_ws_spawn_cursor.valid = false;
+  g_first_frame_done = true;
+  MmxCoopDiagnosticFrame(g_ram);
+}
+
+/* ------------------------------------------------------------------ */
+/* Widescreen Tier-2 helpers, called from gen-code snippets injected by
+ * tools/apply_overrides.py (see that file's header for the full design
+ * and the WS-LOOKAHEAD post-mortem: biasing the committed camera
+ * snapshot froze the scroll state machine, so widening happens at the
+ * consumer comparisons below instead). All return vanilla results when
+ * widescreen is off -> the authentic build behaves identically.
+ *
+ * ws margin in px, rounded to the 8px tile grid, from the live
+ * presentation margin (dynamic with window aspect). */
+static int MmxWsMargin(void) {
+  extern bool g_ws_active;
+  extern int g_ws_extra;
+  extern uint8_t g_ram[0x20000];
+  if ((!g_ws_active && !g_mmx_custom_renderer) || g_ram[0xD1] != 0x02 || g_ram[0xD2] != 0x04)
+    return 0;
+  if (g_mmx_custom_renderer) return MmxWidePolicy_IsStageScene(g_ram) ? (g_mmx_custom_view.extra + 7) & ~7 : 0;
+  return (g_ws_extra + 7) & ~7;
+}
+
+/* bank_02_806E X-axis scroll-off cull: vanilla verdict is
+ * carry = (objX - camX + 0x40) >= 0x180  (keep window cam-64..+320).
+ * Widened: (v + margin) >= 0x180 + 2*margin  (keep window
+ * cam-(64+margin)..+(320+margin)). Returns the carry (0/1). */
+uint16 MmxWsCullVerdictX(uint16 v) {
+  int m = MmxWsMargin();
+  return ((uint16)(v + m) >= (uint16)(0x180 + 2 * m)) ? 1 : 0;
+}
+
+/* bank_82_80B4 X-axis projectile lifetime test: vanilla verdict is
+ * carry = (shotX - camX + 0x20) >= 0x140 (keep window cam-32..+287).
+ * Use the same symmetric live-margin expansion as the enemy cull while
+ * retaining the projectile routine's tighter 0x20/0x140 base window. */
+uint16 MmxWsShotCullVerdictX(uint16 dpage, uint16 v) {
+  return MmxWidePolicy_ShotCull(g_ram, dpage, v, MmxWsMargin(), g_mmx_custom_renderer);
+}
+
+uint16 MmxWsFlyerLeashLimit(void) {
+  return MmxWidePolicy_FlyerLeash(g_mmx_custom_renderer ? MmxWsMargin() : 0);
+}
+uint16 MmxWsRideArmorCullVerdictX(uint16 v) {
+  return MmxWidePolicy_RideArmorCull(v, g_mmx_custom_renderer ? MmxWsMargin() : 0);
+}
+
+/* bank_00_DC36 spawn-scan anchors (one 32px column scanned per camera
+ * column crossing; bank_00_DCDB walks the column's spawn records).
+ * Right anchor: vanilla $1E4D + 0x100 -> +margin so enemies enter the
+ * world before the widescreen right edge shows them. Left: vanilla
+ * $1E4D -> -margin (clamped at 0; DCDB's $E000 guard also drops
+ * wrapped columns). Spawn widening is separately gated
+ * (SNESRECOMP_WS_SPAWN, default ON) so it can fall back to authentic
+ * 4:3 spawning if wide spawning misbehaves; the cull stays wide. */
+static int MmxWsSpawnWide(void) {
+  static int s_on = -1;
+  if (s_on < 0) {
+    const char *e = getenv("SNESRECOMP_WS_SPAWN");
+    s_on = (e && e[0]) ? ((e[0] != '0') ? 1 : 0) : 1;
+  }
+  return s_on;
+}
+
+/* bank_82_808F is the presentation-object position/OAM dispatcher used by
+ * Highway's opening traffic. Its first (horizontal) test is
+ * carry = (objX - camX + 0x60) >= 0x1c0. Ordinary enemy lifetime already
+ * uses the widened bank_02_806E path, but these kind-1 cars never visit it:
+ * at the early spawn anchor 808F marks them offscreen and their F554 updater
+ * immediately clears the object. The dedicated Ride Armor slot also draws
+ * through this routine, so its presentation must match its wider lifetime. */
+uint16 MmxWsPresentationCullVerdictX(uint16 dpage, uint16 v) {
+  extern uint8_t g_ram[0x20000];
+  int m = MmxWsSpawnWide() ? MmxWsMargin() : 0;
+  return MmxWidePolicy_PresentationCull(g_ram, dpage, v, m, g_mmx_custom_renderer);
+}
+
+void MmxWsCullHook(CpuState *cpu, uint32_t pc) {
+  if (!MmxWsMargin()) return;
+  unsigned carry;
+  switch (pc & 0x7fffff) {
+    case 0x02807d: carry=MmxWsCullVerdictX(cpu->A);break;
+    case 0x02809e: carry=MmxWsPresentationCullVerdictX(cpu->D,cpu->A);break;
+    case 0x0280c3: carry=MmxWsShotCullVerdictX(cpu->D,cpu->A);break;
+    case 0x038957: carry=MmxWsRideArmorCullVerdictX(cpu->A);break;
+    default:return;
+  }
+  cpu->_flag_C=carry;cpu->P=(cpu->P&~1)|carry;
+}
+
+/* bank_00_D76A rejects a metasprite tile when (screenX + 16) reaches
+ * vanilla_limit ($010F), which suppresses all ordinary enemy OAM at the
+ * native right edge.  Extending the limit exposes the live right margin;
+ * D6A7 already packs bit 8 of D76A's 16-bit screen X into the SNES OAM high
+ * table, and the widened PPU preserves those positive 256+ coordinates. */
+uint16 MmxWsOamRightLimit(uint16 vanilla_limit) {
+  if (g_mmx_custom_renderer) return vanilla_limit;
+  int m = MmxWsSpawnWide() ? MmxWsMargin() : 0;
+  return (uint16)(vanilla_limit + m);
+}
+
+/* bank_00_D76A's per-metasprite-tile X gate is one UNSIGNED compare:
+ * reject when (screenX + 0x10) >= limit. Negative screen X wraps high
+ * and always rejects, so sprites vanish at x < -16 — the native left
+ * edge — no matter how far MmxWsOamRightLimit widens the right side.
+ * Replace the verdict: accept the right window (against the already
+ * widened limit) OR the left-margin window x+16 in [-margin, 0). The
+ * PPU's 9-bit OAM X path already renders the negative coordinates. */
+uint16 MmxWsOamXReject(uint16 x_plus_16, uint16 widened_limit) {
+  if (g_mmx_custom_renderer) return x_plus_16 >= widened_limit;
+  if (x_plus_16 < widened_limit)
+    return 0;
+  int m = MmxWsSpawnWide() ? MmxWsMargin() : 0;
+  if (m && x_plus_16 >= (uint16)(0u - (uint16)m))
+    return 0;
+  return 1;
+}
+
+/* True when the margins are populated by REAL spawned objects (widened
+ * DC36 anchors + widened 806E cull + wide OAM emission), i.e. the AOT
+ * bodies carry the WS-SPAWN/WS-CULL injections and the spawn gate is on.
+ * The frozen-icon margin preview (mmx_wide_preview.c) must stand down
+ * then — it would composite a static duplicate over the live enemy. */
+int MmxWsRealSpawnActive(void) {
+  return MmxWsSpawnWide() && MmxWsMargin() > 0;
+}
+
+/* A camera-column update runs two scans with independent event-list cursors.
+ * The normal DCDB call uses the host-owned wide cursor/anchor and admits
+ * ordinary type-3 enemies plus narrowly identified Highway traffic. A second
+ * host-paired DCDB call restores the guest's native cursor and unmodified 4:3
+ * anchor for kinds 0-2. Spark's kind-3/id-$03 and Highway's kind-3/id-$22
+ * encounter controllers are also native-owned. The guest cursor remains
+ * save-state-authoritative, so a
+ * rejected wide record is still present when native timing reaches it.
+ * Type-3 ownership otherwise stays strictly disjoint: an early enemy can be
+ * killed before its native anchor without respawning. */
+static struct {
+  uint16 native_anchor;
+  uint16 wide_anchor;
+  uint16 native_cursor_before;
+  uint16 dpage;
+  int active;
+  int visible_rescan;
+  int capsule_rescan;
+} s_ws_spawn_pass;
+
+static uint16 MmxWsSpawnReadCursor(uint16 dpage) {
+  extern uint8_t g_ram[0x20000];
+  return (uint16)(g_ram[(uint16)(dpage + 0x18)] |
+                  ((uint16)g_ram[(uint16)(dpage + 0x19)] << 8));
+}
+
+static void MmxWsSpawnWriteCursor(uint16 dpage, uint16 cursor) {
+  extern uint8_t g_ram[0x20000];
+  g_ram[(uint16)(dpage + 0x18)] = (uint8_t)cursor;
+  g_ram[(uint16)(dpage + 0x19)] = (uint8_t)(cursor >> 8);
+}
+
+static uint16 MmxWsSpawnPreparePasses(uint16 native_anchor,
+                                      uint16 wide_anchor,
+                                      uint16 dpage) {
+  extern uint8_t g_ram[0x20000];
+  const int active = wide_anchor != native_anchor;
+  s_ws_spawn_pass.native_anchor = native_anchor;
+  s_ws_spawn_pass.wide_anchor = wide_anchor;
+  s_ws_spawn_pass.dpage = dpage;
+  s_ws_spawn_pass.active = active;
+  if (!active)
+    return wide_anchor;
+
+  const uint8_t stage = g_ram[0x1f7a];
+  if (s_ws_spawn_cursor_stage != stage) {
+    s_ws_spawn_cursor.valid = false;
+    s_ws_spawn_cursor_stage = stage;
+  }
+  /* A checkpoint restart stays in the same stage but rebuilds the guest's
+   * cursor: a widened cursor left from before the death would skip every
+   * record between the checkpoint and the death. */
+  if (!MmxWidePolicy_WideSpawnCursorPersists(g_ram))
+    s_ws_spawn_cursor.valid = false;
+
+  s_ws_spawn_pass.native_cursor_before = MmxWsSpawnReadCursor(dpage);
+  const uint16 wide_cursor = MmxWidePolicy_BeginWideSpawnPass(
+      &s_ws_spawn_cursor, s_ws_spawn_pass.native_cursor_before);
+  MmxWsSpawnWriteCursor(dpage, wide_cursor);
+  return wide_anchor;
+}
+
+uint16 MmxWsBarrierEnemyState(uint16 controller, uint16 object, uint16 state) {
+  return MmxWidePolicy_BarrierEnemyState(g_ram, controller, object, state, g_mmx_custom_renderer);
+}
+
+/* Sigma stage 1's Vile room is an allocation-order-sensitive scripted
+ * encounter.  Keep its spawn scan at original timing while retaining the
+ * widened renderer, OAM window, and object culling.  Moving any of the room's
+ * type-3 records to the early margin changes which fixed object slots its
+ * controller and cutscene actors receive, and the final dialogue handoff can
+ * then wait forever.  $1E4D is the native camera-column anchor; $0900 is the
+ * door approach and $0A80 is the locked encounter screen. */
+static int MmxWsForceNativeSpawnTiming(void) {
+  extern uint8_t g_ram[0x20000];
+  if (g_ram[0x1f7a] != 0x09) return 0;
+  uint16 column = (uint16)(g_ram[0x1e4d] |
+                           ((uint16)g_ram[0x1e4e] << 8));
+  unsigned lookahead = g_mmx_custom_renderer ? (unsigned)MmxWsMargin() + 32 : 0;
+  return MmxWidePolicy_ForceNativeSpawnTiming(g_ram[0x1f7a], column, lookahead);
+}
+
+/* +32px slack past the visible margin: an anchor of exactly the margin
+ * lands record spawns on the outermost visible wide column (visible
+ * pop-in; vanilla's +0x100 anchor is exactly the masked 4:3 edge).
+ * One column beyond keeps spawns hidden; spawned objects stay inside
+ * the widened 806E keep window (margin+0x40 hysteresis) either side. */
+uint16 MmxWsSpawnAnchorRight(uint16 v, uint16 dpage) {
+  int m = (MmxWsSpawnWide() && !MmxWsForceNativeSpawnTiming())
+              ? MmxWsMargin() : 0;
+  if (m) m += 32;
+  uint16 wide = (uint16)(v + m);
+  return MmxWsSpawnPreparePasses(v, wide, dpage);
+}
+
+uint16 MmxWsSpawnAnchorLeft(uint16 v, uint16 dpage) {
+  int m = (MmxWsSpawnWide() && !MmxWsForceNativeSpawnTiming())
+              ? MmxWsMargin() : 0;
+  if (m) m += 32;
+  uint16 wide = (v >= (uint16)m) ? (uint16)(v - m) : 0;
+  return MmxWsSpawnPreparePasses(v, wide, dpage);
+}
+
+/* Called from DCDB after it reads the event descriptor's first byte. High
+ * bits are difficulty filters; the low nibble is the allocation/event type. */
+int MmxWsSpawnRecordAllowed(uint16 dpage, uint8 type) {
+  extern uint8_t g_ram[0x20000];
+  if (!s_ws_spawn_pass.active) return 1;
+  uint16 anchor = (uint16)(g_ram[dpage] |
+                           ((uint16)g_ram[(uint16)(dpage + 1)] << 8));
+  uint8 kind = type & 0x0f;
+  uint16 rec = MmxWsSpawnReadCursor(dpage);
+  uint8 *descriptor = RomPtr(0x850000u | rec);
+  const uint8 object_id = descriptor[3];
+  if (s_ws_spawn_pass.capsule_rescan) return kind == 3 && object_id == 0x4d;
+  if (s_ws_spawn_pass.visible_rescan)
+    return MmxWidePolicy_RescanSpawnRecord(g_ram[0x1f7a], kind, object_id);
+  if (!g_mmx_custom_renderer && kind == 3 && object_id == 0x37)
+    return anchor == s_ws_spawn_pass.wide_anchor;
+  int allowed = 1;
+  if (anchor == s_ws_spawn_pass.wide_anchor) {
+    allowed = MmxWidePolicy_SpawnRecordAllowed(
+        g_ram[0x1f7a], kind, object_id, false);
+  } else if (anchor == s_ws_spawn_pass.native_anchor) {
+    allowed = MmxWidePolicy_SpawnRecordAllowed(
+        g_ram[0x1f7a], kind, object_id, true);
+  }
+  return allowed;
+}
+
+/* Run DCDB as a balanced synthetic JSR, preserving all guest registers and
+ * cycle accounting while retaining its object allocations/record flags in
+ * WRAM. The original wide anchor is restored for DC36's remaining logic. */
+void MmxWsSpawnRunNativePass(CpuState *cpu) {
+  extern uint8_t g_ram[0x20000];
+  if (!s_ws_spawn_pass.active) return;
+  CpuState saved = *cpu;
+  uint16 dpage = s_ws_spawn_pass.dpage;
+
+  /* The ordinary call just completed the early/wide scan. Preserve its
+   * independent cursor, then restore the guest's authoritative native cursor
+   * before walking the authentic anchor. Rejected records therefore remain
+   * visible to the native pass, while killed early enemies cannot be revisited
+   * because the wide cursor advances monotonically on its own. */
+  MmxWidePolicy_EndWideSpawnPass(
+      &s_ws_spawn_cursor, MmxWsSpawnReadCursor(dpage));
+  MmxWsSpawnWriteCursor(dpage, s_ws_spawn_pass.native_cursor_before);
+  g_ram[dpage] = (uint8_t)s_ws_spawn_pass.native_anchor;
+  g_ram[(uint16)(dpage + 1)] = (uint8_t)(s_ws_spawn_pass.native_anchor >> 8);
+  (void)cpu_dispatch_call_pc(cpu, 0x00DCDBu, 0x00DC8Fu);
+  *cpu = saved;
+  g_ram[dpage] = (uint8_t)s_ws_spawn_pass.wide_anchor;
+  g_ram[(uint16)(dpage + 1)] = (uint8_t)(s_ws_spawn_pass.wide_anchor >> 8);
+  s_ws_spawn_pass.active = 0;
+}
+
+/* Co-op, Unified view: the shared camera sits between the two players, so it
+ * may never scroll far enough for the native scan to reach a Dr. Light
+ * capsule beside X (X standing on its ledge above the screen top). Scan for
+ * capsule records ($4D) around X's own body each frame. DCDB keeps its live
+ * and collected flags; an owned upgrade's capsule still removes itself. */
+static void MmxCoopCapsulePass(CpuState *cpu) {
+  extern uint8_t g_ram[0x20000];
+  if (!MmxCoopEnabled() || MmxCoopViewsOnline() || !MmxWidePolicy_IsStageScene(g_ram)) return;
+  MmxCoopState coop = MmxCoopGetState();
+  if (!coop.initialized || coop.menu_owner || coop.scene_owner) return;
+  int seat = -1;
+  for (int i = 0; i < 2; ++i)
+    if (coop.players[i].character == MMX_COOP_X && coop.players[i].status == MMX_COOP_ALIVE) seat = i;
+  if (seat < 0) return;
+  const uint8_t *b = seat == coop.current ? g_ram + 0xba8 : coop.players[seat].body;
+  int x = b[5] | b[6] << 8, y = b[8] | b[9] << 8;
+  CpuState saved = *cpu;
+  uint16 dpage = cpu->D;
+  uint8 scratch[32]; memcpy(scratch, g_ram + dpage, sizeof(scratch));
+  int top = y - 144;
+  if (top < 0) top = 0;
+  g_ram[dpage + 2] = (uint8)top; g_ram[dpage + 3] = (uint8)(top >> 8);
+  g_ram[dpage + 4] = 0x20; g_ram[dpage + 5] = 1; /* DCDB's height, $0120 */
+  s_ws_spawn_pass.active = s_ws_spawn_pass.capsule_rescan = 1;
+  for (int column = (x - 160) & ~31; column <= x + 160; column += 32) {
+    if (column < 0 || column >= 8192) continue;
+    g_ram[dpage] = (uint8)column; g_ram[dpage + 1] = (uint8)(column >> 8);
+    *cpu = saved;
+    (void)cpu_dispatch_call_pc(cpu, 0x00DCDBu, 0x00DC8Fu);
+  }
+  s_ws_spawn_pass.active = s_ws_spawn_pass.capsule_rescan = 0;
+  memcpy(g_ram + dpage, scratch, sizeof(scratch));
+  *cpu = saved;
+}
+
+void MmxWsCollectiblePass(CpuState *cpu) {
+  extern uint8_t g_ram[0x20000];
+  MmxCoopCapsulePass(cpu);
+  int margin = g_mmx_custom_renderer && MmxWidePolicy_IsStageScene(g_ram) ? MmxWsMargin() : 0;
+  if (!margin) return;
+  /* DC92 runs even when no camera column changed. This matters on a cold
+   * state load: visible pickups and rideable lifts must not wait for X to
+   * move a full column. A vertical climb can also revisit an earlier column.
+   * DCDB remains the allocator, with its collected/live flags untouched. */
+  CpuState saved = *cpu;
+  uint16 dpage = cpu->D;
+  uint8 scratch[32]; memcpy(scratch, g_ram + dpage, sizeof(scratch));
+  int camera = g_ram[0x1e4d] | (g_ram[0x1e4e] << 8);
+  int y = (g_ram[0x1e50] | (g_ram[0x1e51] << 8)) - 32;
+  g_ram[dpage + 2] = (uint8)y; g_ram[dpage + 3] = (uint8)(y >> 8);
+  /* DCDB compares (recordY - top) against a height, not an absolute bottom. */
+  g_ram[dpage + 4] = 0x20; g_ram[dpage + 5] = 1;
+  s_ws_spawn_pass.active = s_ws_spawn_pass.visible_rescan = 1;
+  for (int column = (camera - margin - 32) & ~31; column <= camera + 256 + margin + 32; column += 32) {
+    if (column < 0 || column >= 8192) continue;
+    g_ram[dpage] = (uint8)column; g_ram[dpage + 1] = (uint8)(column >> 8);
+    *cpu = saved;
+    (void)cpu_dispatch_call_pc(cpu, 0x00DCDBu, 0x00DC8Fu);
+  }
+  s_ws_spawn_pass.active = s_ws_spawn_pass.visible_rescan = 0;
+  memcpy(g_ram + dpage, scratch, sizeof(scratch));
+  *cpu = saved;
+}
+
+static bool s_view_spawn_pass;
+/* The widescreen spawn scan keeps Sigma 1's allocation-sensitive Vile room at
+ * native timing (MmxWsForceNativeSpawnTiming); the per-view scan must too, for
+ * every view: either player's camera can approach the room. Ordinary enemies
+ * reach 64px plus the render margin beyond the native spawn column. */
+static bool MmxViewNativeTiming(const MmxCoopState *coop) {
+  unsigned lookahead=64+(unsigned)g_mmx_custom_view.extra;
+  uint8_t stage=g_ram[0x1f7a];
+  if(MmxWidePolicy_ForceNativeSpawnTiming(stage,(uint16_t)(g_ram[0x1e4d]|g_ram[0x1e4e]<<8),lookahead))
+    return true;
+  for(unsigned seat=0;seat<2;++seat) {
+    MmxCoopView v=MmxCoopViewForPlayer(g_ram,coop,seat);
+    if(v.x>=0 && MmxWidePolicy_ForceNativeSpawnTiming(stage,(uint16_t)v.x,lookahead)) return true;
+  }
+  return false;
+}
+static bool MmxViewRecordWanted(unsigned flag,const MmxCoopState *coop) {
+  if(flag<0xfa00 || flag>0xfffb) return false;
+  unsigned rec=g_ram[flag+3]|g_ram[flag+4]<<8;
+  const uint8_t *desc=RomPtr(0x850000u|rec);
+  if(rec<0x8000) return false;
+  int x=(desc[5]|desc[6]<<8)&0x1fff,y=(desc[1]|desc[2]<<8)&0x1fff;
+  unsigned kind=desc[0]&15;
+  if(kind>3) return false;
+  /* Mechanisms, doors and encounter controllers retain their native entry
+   * timing around a player. Ordinary enemies get the usual spawn hysteresis. */
+  bool scripted=kind!=3 || MmxWidePolicy_IsScriptedEncounter(desc[3]) || MmxViewNativeTiming(coop);
+  return MmxCoopViewContains(g_ram,coop,x,y,scripted?0:64,scripted?256:320,
+      scripted?32:64,scripted?256:288,scripted?0:g_mmx_custom_view.extra);
+}
+bool MmxCoopViewsSpawnAllowed(uint16_t dp) {
+  unsigned flag=g_ram[dp+0x14]|g_ram[dp+0x15]<<8;
+  if(MmxCoopViewsSeen(flag)) return false;
+  if(!s_view_spawn_pass) return true;
+  MmxCoopState coop=MmxCoopGetState();
+  return MmxViewRecordWanted(flag,&coop);
+}
+void MmxCoopViewsSpawnWorld(CpuState *cpu) {
+  MmxCoopState coop=MmxCoopGetState();
+  MmxCoopViewsBeginStage(g_ram[0x1f7a]);
+  CpuState saved=*cpu;
+  uint16_t dp=cpu->D;
+  uint8_t scratch[32];memcpy(scratch,g_ram+dp,sizeof(scratch));
+  /* The native table has one pointer per 32px column. Flag entries are
+   * (live byte, Y word, ROM descriptor word). Reuse DCDB's allocator and
+   * collected flags, with a separate rollback-owned visit bit preventing
+   * killed enemies from reappearing during a stationary rescan. */
+  for(unsigned col=0;col<256;++col) {
+    unsigned table=0xf800+col*2;
+    unsigned first=g_ram[table]|g_ram[table+1]<<8;
+    unsigned end=g_ram[table+2]|g_ram[table+3]<<8;
+    if(first<0xfa02 || end>0xfffc || end<first || (end-first)%5) continue;
+    bool spawn=false;
+    for(unsigned flag=first;flag<end;flag+=5) {
+      bool wanted=MmxViewRecordWanted(flag,&coop);
+      if(!wanted) MmxCoopViewsMark(flag,false);
+      else if(g_ram[flag]) MmxCoopViewsMark(flag,true);
+      else if(!MmxCoopViewsSeen(flag)) spawn=true;
+    }
+    if(!spawn) continue;
+    /* Candidate filtering is per rectangle/record, so a wide vertical scan
+     * cannot load the empty gap between two separated players. */
+    memset(g_ram+dp,0,6);
+    g_ram[dp]=(uint8_t)(col*32);g_ram[dp+1]=(uint8_t)(col*32>>8);
+    g_ram[dp+4]=0xff;g_ram[dp+5]=0x1f;
+    s_view_spawn_pass=true;*cpu=saved;
+    (void)cpu_dispatch_call_pc(cpu,0x00dcdbu,0x00dc8fu);
+    s_view_spawn_pass=false;
+    for(unsigned flag=first;flag<end;flag+=5)
+      if(g_ram[flag] && MmxViewRecordWanted(flag,&coop)) MmxCoopViewsMark(flag,true);
+  }
+  memcpy(g_ram+dp,scratch,sizeof(scratch));*cpu=saved;
+}
+
+/* bank_82_B964 controls the intro-stage helicopter's entrance. Vanilla
+ * starts its descent when (objX - 0x80) < X's world X, which places its
+ * center at the native right edge. Add the visible widescreen margin plus
+ * 32px of sprite-footprint lead so the large helicopter's outer tiles enter
+ * naturally instead of its controller waking only when the center reaches
+ * the widened edge. */
+uint16 MmxWsEnemyActivationDistance(uint16 v, uint16 object) {
+  int m = MmxWsSpawnWide() ? MmxWsMargin() : 0;
+  if (m) m += 32;
+  /* The arena push stays native; only the visible descent gets widescreen
+   * lead. Also release prematurely latched locks in older spike saves. */
+  if (g_mmx_custom_renderer) {
+    extern uint8_t g_ram[0x20000];
+    return MmxWidePolicy_BeeEntrance(g_ram, object, (uint16)(v + m));
+  }
+  return (uint16)(v + m);
+}
+
+void MmxWsStreakerEntrance(uint16 object) {
+  extern uint8_t g_ram[0x20000];
+  if (g_mmx_custom_renderer && MmxWsSpawnWide())
+    MmxWidePolicy_StreakerEntrance(g_ram, object, MmxWsMargin());
+}
+
+uint16 MmxWsChainPlatformLine(CpuState *cpu, uint16 line) {
+  if (!g_mmx_custom_renderer || !MmxWsSpawnWide() || cpu->X != 5) return line;
+  unsigned margin = MmxWsMargin();
+  uint16 adjusted = MmxWidePolicy_ChainPlatformLine(g_ram, cpu->D, line, margin);
+  if (adjusted == line) return line;
+  uint16 player = g_ram[0xbad] | (g_ram[0xbae] << 8);
+  bool right = (int16)(player - adjusted) >= 0;
+  bool inside = g_ram[cpu->D + 0xb] == 3 ? right : !right;
+  for (unsigned object = 0x1628; inside && object < 0x1928; object += 0x30)
+    if (g_ram[object] && g_ram[object + 10] == 0x0e) inside = false;
+  if (inside) {
+    /* F944 initializes the switch state without firing an edge. Catch up
+     * initial loads already inside the widened interval with the original
+     * idempotent allocator. Its later native call cannot double platforms. */
+    CpuState saved = *cpu;
+    uint8 scratch[0x20]; memcpy(scratch, g_ram, sizeof(scratch));
+    uint32 bank = (uint32)cpu->PB << 16;
+    (void)cpu_dispatch_call_pc(cpu, bank | 0xFAC5u, bank | 0xF97Au);
+    memcpy(g_ram, scratch, sizeof(scratch));
+    *cpu = saved;
+  }
+  return adjusted;
+}
+
+/* bank_03_FDD3 camera-line trigger compare. Tilemap screen staging
+ * (Task_B091 via FE05/FE0C) is fired by level-placed camera-line
+ * trigger objects: FDD3 compares live camera X ($0BAD, via $0BA8+X
+ * with X=5 from the $86:E4DC offset table) against the trigger's
+ * line at obj D+$05; state 0 (FDAB) fires on cam < line (stage
+ * left), state 2 (FDC0) fires on cam >= line (stage right). Shift
+ * the fire line INTO the travel direction by the margin so the
+ * leading widescreen margin is staged before it scrolls on screen.
+ * A single direction-aware line keeps the two fire conditions
+ * complementary at every instant -> no fire-loop; worst case equals
+ * vanilla wiggling across the line (one restage per flip). Only
+ * X-axis staging watchers are biased: offset X==5 and event code
+ * byte (obj D+$0A) == 0x15. Y staging (0x18, offset 8) has no
+ * vertical margins; codes 0x16/0x17 are other trigger classes
+ * (camera locks etc.) and must fire at authentic positions. */
+static int MmxWsStageWide(void) {
+  if (g_mmx_custom_renderer) return 0;
+  static int s_on = -1;
+  if (s_on < 0) {
+    const char *e = getenv("SNESRECOMP_WS_STAGE");
+    /* Early guest staging also swaps the section's shared OBJ graphics.
+     * The renderer-side BG2 prefill now supplies first-visit margins without
+     * advancing that guest resource transition, so preserve authentic timing
+     * by default. Keep this as an opt-in diagnostic for older comparisons. */
+    s_on = (e && e[0]) ? ((e[0] != '0') ? 1 : 0) : 0;
+  }
+  return s_on;
+}
+
+/* WS-SHADOW fire pairing: when the biased FDD3 verdict is about to fire
+ * a staging (FE05/FE0C -> Task_B091 -> B23C per screen), remember the
+ * direction + trigger line so the B23C hook below can bind the staged
+ * screen to its world chunk for the runner-side margin shadow.
+ * Right-fire stages the chunk entered at the line's boundary
+ * (line+0x40, measured); left-fire restores the chunk two screens back
+ * (line+0x40-0x200, the half that held the off-right screen). */
+static struct {
+  int dir;          /* +1 right, -1 left, 0 none pending */
+  uint16 line;      /* unbiased trigger line */
+  int frame;        /* stamp for expiry */
+} s_ws_fire;
+
+uint16 MmxWsStageLineAdjust(uint16 v, uint16 dpage, uint16 xoff) {
+  extern uint8_t g_ram[0x20000];
+  static uint16 s_prev;
+  static int s_dir;
+  uint16 cam = (uint16)(g_ram[0x1E6A] | (g_ram[0x1E6B] << 8));
+  if (cam != s_prev) {
+    s_dir = ((int16)(cam - s_prev) > 0) ? 1 : -1;
+    s_prev = cam;
+  }
+  int m = MmxWsStageWide() ? MmxWsMargin() : 0;
+  if (!m || xoff != 5) return v;
+  if (g_ram[(uint16)(dpage + 0x0A)] != 0x15) return v;
+  /* Fire lead = the margin, no more. Region fires also upload the next
+   * section's enemy/sprite CHR; firing further ahead (a margin+96
+   * experiment) swapped tiles out from under still-alive current-
+   * section enemies -> intermittent sprite garbling (user-reported,
+   * 2026-07-06). First-visit margin content is the prefill/shadow's
+   * job, not the fire bias's. SNESRECOMP_WS_STAGE_BIAS=<px> overrides
+   * for experiments (capped at 184). */
+  {
+    static int s_bias_env = -2;
+    if (s_bias_env == -2) {
+      const char *e = getenv("SNESRECOMP_WS_STAGE_BIAS");
+      s_bias_env = (e && e[0]) ? atoi(e) : -1;
+    }
+    if (s_bias_env >= 0) m = s_bias_env;
+    if (m > 184) m = 184;
+    if (!m) return v;
+  }
+  uint16 adj = v;
+  if (s_dir > 0) adj = (v >= (uint16)m) ? (uint16)(v - m) : 0;
+  else if (s_dir < 0) adj = (uint16)(v + m);
+  /* Predict the caller's verdict to pair the fire with the staging it
+   * schedules: state (D+2) 0 = FDAB fires on live < line', 2 = FDC0
+   * fires on live >= line'. Live value = the BG-module camera $0BAD. */
+  uint8_t state = g_ram[(uint16)(dpage + 0x02)];
+  uint16 live = (uint16)(g_ram[0x0BAD] | (g_ram[0x0BAE] << 8));
+  int fires = (state == 2) ? (live >= adj) : (state == 0 ? (live < adj) : 0);
+  if (fires) {
+    s_ws_fire.dir = (state == 2) ? 1 : -1;
+    s_ws_fire.line = v;
+    s_ws_fire.frame = snes_frame_counter;
+  }
+  return adj;
+}
+
+/* ------------------------------------------------------------------ */
+/* WS-CHRBIND -- fix attempt #2 for the widescreen margin-enemy garbled
+ * CHR. Fix attempt #1
+ * gated the wide spawn admission on the VRAM-CHR slot's raw *value*
+ * being nonzero, and was rejected: zero is also the legitimate tile-base
+ * for any enemy whose real page happens to be page 0, so that predicate
+ * cannot tell "not yet allocated" from "allocated at page 0", and every
+ * such enemy (or any spawn record whose layout didn't match the
+ * transcription) was permanently vetoed from the wide pass -- undoing
+ * WS-SPAWN's early margin entry for exactly the enemies it was built for.
+ *
+ * This attempt does not touch spawn admission AT ALL. Instead it lets the
+ * game's own inlined OAM tile-base binders run exactly as before --
+ * including binding a possibly-not-yet-populated tile-base when one
+ * fires too early -- and observes their bind inputs via the injected
+ * WS-CHRBIND hook (tools/apply_overrides.py). The bind sequence (read
+ * WRAM $7F:8200+X -> store [D+0x18]; read $7F:8300+X -> store [D+0x11])
+ * is INLINED per enemy type, not a single shared function:
+ * bank_82_827D_M1X1 (src/gen/bank82_part00_v2.c:14370-14526) is only ONE
+ * of 8 verified inlined copies (bank_82_EDA5/F554, bank_83_F945,
+ * bank_87_B824/F42A/F477, bank_88_EAA4 are the others -- see
+ * tools/apply_overrides.py's WS-CHRBIND docstring for the full per-site
+ * list). The flying-mech family (gfx 0x10/0x11/0x12, the original
+ * residual garbled-spike symptom) binds through one of the non-827D
+ * copies, never through 827D -- why the single-site fix was partial.
+ *
+ * The generalized injector (tools/apply_overrides.py) anchors on the
+ * tile-base *read* (`0x7f8200 + cpu->X`, identical at every site) and
+ * injects immediately after that same bind's tile-base *store*:
+ *   cpu_write8(cpu, 0x00, (uint16)(cpu->D + 0x0018), _v12);  // tile-base
+ *   /-*WS-CHRBIND*-/ { ...; MmxWsChrBindNote(cpu->D, cpu->X); }
+ * NOT after the palette store: per-site inspection found the palette
+ * half is NOT uniform across sites -- most do a plain store, but three
+ * (bank_82_EDA5, bank_83_F945, bank_87_F42A) instead do an ORA-style
+ * read-modify-write (`_m = read[D+0x11]; write[D+0x11] = _m | A`) that
+ * merges the table's palette nibble into pre-existing high bits of that
+ * byte (other object flags share D+0x11 with the palette-select nibble
+ * on those three). Replaying a raw palette table byte on rebind would
+ * stomp those bits, so this mechanism only ever heals the tile-base --
+ * see MmxWsChrRebindSweep below.
+ *
+ * At the injection point cpu->D (the spawning object's base) and cpu->X
+ * (the VRAM-CHR slot index) still hold exactly the values the bind
+ * itself used (tools/apply_overrides.py verifies per-site, and at
+ * pattern-match time, that nothing between the anchor and the tile-base
+ * store reassigns cpu->X or cpu->D). No re-derivation of gfx-index ->
+ * slot is needed or performed here (the earlier record+3 / $A5E5
+ * host-side transcription was measured WRONG for composite mechs on
+ * 2026-08-06, so this fix deliberately never repeats
+ * that derivation).
+ *
+ * The host latches {object base, slot, the slot's WRAM entry at bind
+ * time, the object's gfx-index (to detect the object dying/being reused),
+ * bind frame}. Once per frame (MmxWsChrRebindSweep, called from
+ * RtlDrawPpuFrame same as MmxDisplay_PrepareBg2Shadow) each live latch is
+ * rechecked: if the allocator has since written a DIFFERENT value into
+ * that same slot, the object bound too early and the tile-base store is
+ * replayed with the fresh value -- this is allocation VALIDITY tracked by
+ * *change*, not by the value's zero-ness, so a legitimate page-0 bind
+ * that never changes is never touched, and an early bind that latched a
+ * stale value snaps to the real one as soon as the allocator writes it. */
+#define MMX_WS_CHRBIND_CAP 96  /* was 48: WS-CHRBIND-COPY adds 42 more
+                                 * inlined injection sites (the "clone my
+                                 * own tile-base to a sibling/child" idiom,
+                                 * tools/apply_overrides.py) that can each
+                                 * seed an additional CHILD latch into this
+                                 * same ring whenever their parent object is
+                                 * itself under an active latch; doubled
+                                 * again for headroom so that traffic can't
+                                 * recycle a still-live latch out from under
+                                 * an object before its budget is spent. */
+#define MMX_WS_CHRBIND_MAX_AGE_FRAMES 600u
+#define MMX_WS_CHRBIND_MAX_REBINDS 3
+
+typedef struct {
+  uint16_t obj_d;        /* object base (cpu->D at bind time) */
+  uint8_t slot;          /* VRAM-CHR allocation slot (cpu->X at bind time) */
+  uint8_t gfx;           /* g_ram[obj_d+0x0a] at bind time; object identity
+                          * check -- if this changes the struct was reused
+                          * by a different object and the latch is stale */
+  uint8_t read_entry;    /* g_ram[0x18200+slot] observed at bind time */
+  uint8_t rebind_count;  /* capped at MMX_WS_CHRBIND_MAX_REBINDS */
+  uint8_t used;
+  uint32_t frame;        /* snes_frame_counter at (re)bind time, for expiry */
+} MmxWsChrBindLatch;
+
+static MmxWsChrBindLatch s_ws_chrbind_latches[MMX_WS_CHRBIND_CAP];
+static int s_ws_chrbind_next;  /* ring cursor: overwrite-oldest on cap */
+static uint32_t s_ws_chrbind_binds_seen;
+static uint32_t s_ws_chrbind_rebinds_performed;
+static uint32_t s_ws_chrbind_copies_seen;
+static uint32_t s_ws_chrbind_copy_latches_created;
+
+/* Shared gate for both the hook and the sweep, mirroring
+ * MmxDisplay_PrepareBg2Shadow's own in-stage gate: everything here is a
+ * pure no-op (hook is a call+return, sweep is called but exits
+ * immediately) whenever widescreen is inactive or the game isn't in
+ * live stage gameplay, so authentic 4:3 play is unaffected. */
+static int MmxWsChrBindActive(void) {
+  extern bool g_ws_active;
+  extern uint8_t g_ram[0x20000];
+  return (g_ws_active || g_mmx_custom_renderer) && g_ram[0x00D1] == 0x02 && g_ram[0x00D2] == 0x04;
+}
+
+/* Residual Highway crusher repair. The crusher body owns the CHR binding;
+ * its attack/extension renderer object points back to that body in +$0c.
+ * The first widescreen-spawned pair reaches bank_00_D6A7 with the parent
+ * correctly rebound but the render child still carrying a stale +$18 byte.
+ * The later vanilla-timed pair proves the intended invariant for this exact
+ * child: its render base must match the parent. Reconcile at D6A7's handoff
+ * before the value is copied into render scratch +$10. This also works after
+ * loading an old save, where host-only bind latches do not exist.
+ *
+ * Keep this a render-only correction: changing the guest child field would
+ * broaden the fix to later consumers without evidence that they are wrong.
+ * Do not infer validity from zero, because page 0 is legitimate. Accept the
+ * parent only for Highway stage 0 and the stable, relational crusher
+ * signature: an aligned child gfx $09 pointing through +$0c to a live,
+ * aligned parent gfx $0f. The parent live byte is deliberately not part of
+ * the signature: on death the body clears it before the detached crusher
+ * child finishes falling, while the child's parent pointer and the parent's
+ * gfx/base fields remain authoritative. Do not use child +$14/+16 as
+ * identity: those are live behavior-state pointers and change as the crusher
+ * descends/extends. */
+uint8 MmxWsChrBindResolveParent(uint16 scratchD, uint16 objectX,
+                                uint8 childBase) {
+  if (!MmxWsChrBindActive()) return childBase;
+  extern uint8_t g_ram[0x20000];
+  uint16 child = (uint16)(scratchD + objectX);
+  return MmxWidePolicy_CrusherTileBase(g_ram, child, childBase);
+}
+
+/* Called via the WS-CHRBIND injection right after each inlined bind site's
+ * own tile-base store. objD/slotX are transcribed directly from cpu->D and
+ * cpu->X at that point -- see the file comment above for why this must
+ * never re-derive them. slotX is masked to 8 bits defensively; every one
+ * of the 8 verified sites reaches its tile-base read with x_flag=1 (each
+ * zeros X's high byte on load just before the read -- see
+ * tools/apply_overrides.py's WS-CHRBIND docstring), so X is
+ * hardware-guaranteed 8-bit here, but the mask keeps this safe even if a
+ * future variant changes that. */
+void MmxWsChrBindNote(uint16 objD, uint16 slotX) {
+  if (!MmxWsChrBindActive()) return;
+  extern uint8_t g_ram[0x20000];
+  uint8_t slot = (uint8_t)(slotX & 0xff);
+  s_ws_chrbind_binds_seen++;
+  MmxWsChrBindLatch *l = &s_ws_chrbind_latches[s_ws_chrbind_next];
+  s_ws_chrbind_next = (s_ws_chrbind_next + 1) % MMX_WS_CHRBIND_CAP;
+  l->obj_d = objD;
+  l->slot = slot;
+  l->gfx = g_ram[(uint16)(objD + 0x0a)];
+  l->read_entry = g_ram[0x18200 + slot];
+  l->rebind_count = 0;
+  l->frame = (uint32_t)snes_frame_counter;
+  l->used = 1;
+}
+
+/* Called via the WS-CHRBIND-COPY injection (tools/apply_overrides.py)
+ * right after each of the 42 verified inlined "clone my own tile-base to
+ * a sibling/child object" sites' chained store completes -- the 65816
+ * idiom `LDA [D+0x18] / STA 0x0018,X`, which never touches $7F:8200 at
+ * all and so is invisible to MmxWsChrBindNote above. parentD is the
+ * COPYING object's own D (transcribed directly, per the injector's
+ * regen-drift guard that nothing reassigns cpu->D between the anchor and
+ * the store); childBase is cpu->X, the sibling/child's own object base
+ * (NOT a VRAM-CHR slot index -- a different value space than
+ * MmxWsChrBindNote's slotX, see the module docstring's WS-CHRBIND-COPY
+ * section).
+ *
+ * This deliberately does NOT create a latch from nothing: if the
+ * copying object's own bind was never suspect (no active WS-CHRBIND
+ * latch for parentD -- e.g. its tile-base came from a fully-populated
+ * slot, or its latch already retired healthily), there is no allocator
+ * slot to compare the child against and nothing to propagate. Only when
+ * the parent IS still under an active latch does the child need one too
+ * -- it just inherited the parent's (possibly still-stale) tile-base by
+ * value, so it must heal on the same VRAM-CHR slot change the parent is
+ * waiting on. The child's latch is seeded into the SAME ring
+ * MmxWsChrRebindSweep already sweeps every frame; no separate sweep path
+ * exists for copies. */
+void MmxWsChrBindNoteCopy(uint16 parentD, uint16 childBase) {
+  if (!MmxWsChrBindActive()) return;
+  extern uint8_t g_ram[0x20000];
+  s_ws_chrbind_copies_seen++;
+  /* Most-recently (re)bound active latch for the parent -- CAP is small
+   * and fixed (96), and this runs once per copy-site hit (not per
+   * frame), so a linear scan needs no secondary index. */
+  MmxWsChrBindLatch *parent = NULL;
+  for (int i = 0; i < MMX_WS_CHRBIND_CAP; i++) {
+    MmxWsChrBindLatch *l = &s_ws_chrbind_latches[i];
+    if (l->used && l->obj_d == parentD) {
+      if (!parent || l->frame >= parent->frame) parent = l;
+    }
+  }
+  if (!parent) return;
+  MmxWsChrBindLatch *c = &s_ws_chrbind_latches[s_ws_chrbind_next];
+  s_ws_chrbind_next = (s_ws_chrbind_next + 1) % MMX_WS_CHRBIND_CAP;
+  c->obj_d = childBase;
+  c->slot = parent->slot;  /* same VRAM-CHR allocation as the parent */
+  c->read_entry = g_ram[(uint16)(childBase + 0x18)];  /* the just-copied
+                                                        * stale value */
+  /* [childBase+0x0a] (gfx/identity) may still be 0 here -- the spawn
+   * routine commonly writes the child's gfx byte LATER in the same
+   * routine, after this copy. MmxWsChrRebindSweep's eviction handles
+   * this: it adopts the identity byte once it becomes nonzero rather
+   * than treating "not yet written" as "object already died". */
+  c->gfx = g_ram[(uint16)(childBase + 0x0a)];
+  c->rebind_count = 0;
+  c->frame = (uint32_t)snes_frame_counter;
+  c->used = 1;
+  s_ws_chrbind_copy_latches_created++;
+}
+
+/* Called once per frame from RtlDrawPpuFrame (src/main.c), same call site
+ * attempt #1 used for its heal sweep. For every live latch: drop it if
+ * it's aged out or the object was evidently reused (gfx-index changed);
+ * otherwise, if the allocator has written a NEW value into the latched
+ * slot since the bind (or since the last rebind), replay the tile-base
+ * store with the fresh value -- an exact mirror of the bind site's own
+ * `cpu_write8(cpu, 0x00, cpu->D + 0x0018, ...)`, not a fabricated one.
+ * A slot can legitimately be written in stages (e.g. tile-base arrives
+ * before palette finishes streaming), so the latch is kept alive across
+ * multiple rebinds rather than retired after the first -- capped at
+ * MMX_WS_CHRBIND_MAX_REBINDS so a slot that pathologically keeps changing
+ * cannot re-stomp the object's binding forever.
+ *
+ * Deliberately heals ONLY the tile-base (D+0x18), never the palette
+ * (D+0x11): per-site inspection (2026-08-06, generalizing this pass from
+ * the single 827D site to all 8 real bind sites -- see
+ * tools/apply_overrides.py's WS-CHRBIND docstring) found the palette half
+ * is not a uniform raw copy everywhere. Three sites (bank_82_EDA5,
+ * bank_83_F945, bank_87_F42A) build D+0x11 as `old_D11 | palette_nibble`,
+ * i.e. the byte also carries other per-object bits (priority/flags) that
+ * legitimately share it with the palette-select nibble. A raw
+ * `g_ram[objD+0x11] = g_ram[0x18300+slot]` replay here would blow away
+ * those bits on those objects. The tile-base field has no such sharing at
+ * any site (always a plain copy), so it is the only half that is always
+ * safe to replay this way; the palette table value is still recorded in
+ * the latch (read_entry mirrors the tile-base table, not the palette
+ * one) purely for the change-detection trigger, not for replay. */
+void MmxWsChrRebindSweep(void) {
+  if (!MmxWsChrBindActive()) return;
+  extern uint8_t g_ram[0x20000];
+  /* The armored turtle ($5B) caches its normal palette in .35 at
+   * $87:EC59. Wide spawning can initialize it before its section resource
+   * loads, caching zero permanently; $87:EBFE then restores that zero on
+   * every update. Repair only that uninitialized cache when the ROM's
+   * resource palette becomes available. Ordinary hit flashes keep their
+   * nonzero cached palette and are untouched. */
+  unsigned turtle_resource=RomPtr(0x86a5e4)[(0x5b-1)*2+1];
+  uint8_t turtle_palette=g_ram[0x18300+turtle_resource]&14;
+  if(turtle_palette) for(unsigned d=0xe68;d<0x1228;d+=64)
+    if(g_ram[d] && g_ram[d+10]==0x5b && g_ram[d+1]>=2 && !(g_ram[d+0x35]&14)) {
+      g_ram[d+0x35]=turtle_palette;
+      /* A missing allocation also lost the section's ordinary OBJ
+       * priority. Otherwise its now-correct pixels hide behind BG1. */
+      g_ram[d+0x11]=(g_ram[d+0x11]&~14u)|turtle_palette|0x20;
+    }
+  uint32_t now = (uint32_t)snes_frame_counter;
+  for (int i = 0; i < MMX_WS_CHRBIND_CAP; i++) {
+    MmxWsChrBindLatch *l = &s_ws_chrbind_latches[i];
+    if (!l->used) continue;
+    /* Eviction. [D+0x0a] equality is NOT usable as the identity test:
+     * for the composite flying-mech family that byte is the animation /
+     * deploy sub-state index and cycles 0x10->0x11->0x12 during the
+     * deploy sequence itself (measured 2026-08-06) -- evicting on any
+     * change silently dropped exactly the latches whose objects were
+     * mid-deploy, which is why deploy-state tiles stayed stale while
+     * idle-state ones healed. Keep only age (bounded lifetime) and
+     * "slot freed" (gfx 0) as eviction causes; per-heal safety against
+     * struct reuse is enforced below at the write itself.
+     *
+     * "Slot freed" must be a live-to-dead TRANSITION (gfx went from
+     * nonzero to zero), not a bare "gfx == 0" snapshot: a WS-CHRBIND-COPY
+     * child latch can be seeded (MmxWsChrBindNoteCopy) BEFORE the spawn
+     * routine gets around to writing the child's own gfx/identity byte
+     * later in the same routine, so its latch legitimately starts with
+     * gfx == 0. A bare "== 0" eviction would drop that latch on the very
+     * next sweep, before it ever got a chance to heal. Instead: while
+     * gfx == 0 and the live byte has since become nonzero, ADOPT it (the
+     * latch gains its identity check once the child finishes
+     * initializing); only evict once a latch that HAD a nonzero identity
+     * sees it go back to zero (the object actually died / slot freed). */
+    uint8_t cur_gfx = g_ram[(uint16)(l->obj_d + 0x0a)];
+    if ((now - l->frame) > MMX_WS_CHRBIND_MAX_AGE_FRAMES ||
+        (l->gfx != 0 && cur_gfx == 0)) {
+      l->used = 0;
+      continue;
+    }
+    if (l->gfx == 0 && cur_gfx != 0) {
+      l->gfx = cur_gfx;
+    }
+    uint8_t cur = g_ram[0x18200 + l->slot];
+    if (cur != l->read_entry) {
+      /* Heal only while the object still carries the exact stale value
+       * this latch saw the bind site store: if the game itself re-bound
+       * the object (fresh table read -> already correct), or the struct
+       * was reused by a different object (its own base, not ours),
+       * [D+0x18] no longer equals read_entry and we must not touch it.
+       * This guard replaces the dropped gfx-equality identity test with
+       * a per-write one that cannot stomp a healthy binding. */
+      if (l->rebind_count < MMX_WS_CHRBIND_MAX_REBINDS &&
+          g_ram[(uint16)(l->obj_d + 0x18)] == l->read_entry) {
+        /* Mirror the bind site's tile-base store only -- see the
+         * function comment above for why the palette store is
+         * intentionally never replayed here. */
+        g_ram[(uint16)(l->obj_d + 0x18)] = cur;
+        s_ws_chrbind_rebinds_performed++;
+        l->rebind_count++;
+        l->frame = now;
+      }
+      l->read_entry = cur;
+    }
+  }
+}
+
+uint32_t MmxWsChrBindsSeen(void) { return s_ws_chrbind_binds_seen; }
+uint32_t MmxWsChrRebindsPerformed(void) { return s_ws_chrbind_rebinds_performed; }
+uint32_t MmxWsChrBindCopiesSeen(void) { return s_ws_chrbind_copies_seen; }
+uint32_t MmxWsChrBindCopyLatchesCreated(void) { return s_ws_chrbind_copy_latches_created; }
+
+/* CHR healing latches affect later guest OAM writes, so they belong to the
+ * timeline along with the spawn cursor. Diagnostic counters do not. */
+static MmxWsChrBindLatch s_loaded_chrbind[MMX_WS_CHRBIND_CAP];
+static int s_loaded_chrbind_next;
+static void MmxWideStateSave(struct SaveLoadInfo *sli) {
+  sli->func(sli, s_ws_chrbind_latches, sizeof(s_ws_chrbind_latches));
+  sli->func(sli, &s_ws_chrbind_next, sizeof(s_ws_chrbind_next));
+}
+static void MmxWideStateLoad(struct SaveLoadInfo *sli) {
+  sli->func(sli, s_loaded_chrbind, sizeof(s_loaded_chrbind));
+  sli->func(sli, &s_loaded_chrbind_next, sizeof(s_loaded_chrbind_next));
+}
+static void MmxWideStateApply(bool loaded) {
+  if (loaded) {
+    memcpy(s_ws_chrbind_latches, s_loaded_chrbind, sizeof(s_ws_chrbind_latches));
+    s_ws_chrbind_next = s_loaded_chrbind_next;
+  } else {
+    memset(s_ws_chrbind_latches, 0, sizeof(s_ws_chrbind_latches));
+    s_ws_chrbind_next = 0;
+  }
+  s_ws_spawn_pass.active = 0;
+}
+
+/* RtlGameInfo.hardware_reset: the Reset hotkey reset the machine under a live
+ * session. Everything that says "the game already booted" is host state, so
+ * without this the next frame skipped I_RESET and ran NMI plus the $8099
+ * scheduler against a force-blanked PPU -- a black screen that never
+ * recovers (GitHub #45). Runs on the main fiber, never inside a slot fiber,
+ * so every slot fiber can be deleted here. */
+void MmxOnHardwareReset(void) {
+  MmxBossRushReset();MmxBossRushAudioReset();
+  MmxCoopReset();
+  for (int i = 0; i < MMX_NSLOTS; i++) {
+    if (g_slot_fiber[i] != NULL) {
+      DeleteFiber(g_slot_fiber[i]);
+      g_slot_fiber[i] = NULL;
+    }
+  }
+  memset(g_slot_fiber_pc, 0, sizeof(g_slot_fiber_pc));
+  memset(g_slot_prev_state, 0, sizeof(g_slot_prev_state));
+  memset(g_slot_done, 0, sizeof(g_slot_done));
+  memset(g_slot_yield_cd, 0, sizeof(g_slot_yield_cd));
+  memset(g_slot_saved_state, 0, sizeof(g_slot_saved_state));
+  memset(&g_saved_scheduler_state, 0, sizeof(g_saved_scheduler_state));
+  memset(g_slot_resume, 0, sizeof(g_slot_resume));
+  memset(g_slot_base_s, 0, sizeof(g_slot_base_s));
+  memset(g_slot_resume_pending, 0, sizeof(g_slot_resume_pending));
+  g_current_slot_idx = 0xFF;
+  g_mmx_task_slot_x = 0;
+  g_mmx_task_yield_countdown = 0;
+  g_yield_captures_resume = 1;
+  g_load_chunk_ok = 0;
+  g_load_complete = g_load_native_streakers = false;
+  s_ws_recover_armor = false;
+  s_ws_spawn_cursor.valid = false;
+  s_ws_spawn_cursor_stage = 0xff;
+  MmxWideStateApply(false);
+  memset(&s_ws_spawn_pass, 0, sizeof(s_ws_spawn_pass));
+  memset(&s_ws_fire, 0, sizeof(s_ws_fire));
+  g_did_reset = false;
+  g_first_frame_done = false;
+}

@@ -1,0 +1,23 @@
+# ROM y datos con derechos: nunca se suben
+*.sfc
+*.smc
+*.rom
+*.pcm
+dspfirm.cdc
+
+# Código generado desde la ROM (tools/regen.sh)
+/src/gen/
+
+# Compilación
+platform/3ds/build-game/
+platform/3ds/build-game-host/
+platform/3ds/build-host/
+platform/3ds/dist/
+*.o
+*.d
+*.elf
+*.3dsx
+*.cia
+*.smdh
+*.bnr
+__pycache__/
