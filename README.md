@@ -58,7 +58,7 @@ Las herramientas de prueba del PC se compilan con `make -f Makefile.game HOST=1 
 - `snesrecomp/`: runtime y recompilador (submódulo). Se modifica con `platform/3ds/patches/snesrecomp-3ds.patch`.
 
 ## Créditos
-- Port para New 3DS: Juanjo ([jzpgames](https://github.com/jzpgames)).
+- Port para New 3DS: [jzpgames](https://github.com/jzpgames).
 - Basado en [MegaManXSNESRecomp](https://github.com/mstan/MegaManXSNESRecomp) de mstan y en [snesrecomp](https://github.com/RetroPortingToolKit/snesrecomp).
 - Anotaciones de código: [dizProjects](https://github.com/bogaa/dizProjects).
 - Numeración MSU-1 compatible con el parche de DarkShock (Michaël Larouche). Los packs pertenecen a sus autores.
