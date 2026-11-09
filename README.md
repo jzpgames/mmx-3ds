@@ -2,7 +2,7 @@
 
 Port no oficial de **Mega Man X (SNES)** para **New Nintendo 3DS / New 3DS XL / New 2DS XL**. No es un emulador: el juego está recompilado y corre nativo en la consola.
 
-Necesitas tu propia ROM. Este repositorio no incluye la ROM, ni código generado a partir de ella, ni música.
+Necesitas tu propia ROM de **Mega Man X (USA) Rev 1 (v1.1)**. Este repositorio no incluye la ROM, ni código generado a partir de ella, ni música.
 
 ## Características
 - **3D estereoscópico:** los fondos tienen profundidad en todas las fases, en las salas de jefes y en la selección de etapas. Con el deslizador abajo, la imagen es idéntica al original.
@@ -16,7 +16,8 @@ Necesitas tu propia ROM. Este repositorio no incluye la ROM, ni código generado
 Descarga el zip desde **[Releases](../../releases)**. Adentro está el LEEME completo.
 
 1. Instala el `.cia` con FBI, o copia `3ds/mmx-3ds/` a la SD y abre el `.3dsx` desde el Homebrew Launcher.
-2. Copia tu ROM de **Mega Man X (USA)**, sin modificar, a `sdmc:/3ds/mmx-3ds/mmx.sfc`.
+2. Copia tu ROM de **Mega Man X (USA) Rev 1 (v1.1)**, sin modificar, a `sdmc:/3ds/mmx-3ds/mmx.sfc`. Sirve con o sin header. Otras versiones (la 1.0 de EE. UU., la europea o la japonesa Rockman X) no funcionan: el juego verifica la ROM al iniciar.
+   - CRC32 sin header: `DED53C64`
 3. Para tener sonido, la SD debe tener el archivo `sdmc:/3ds/dspfirm.cdc`. Si otros homebrew ya te suenan, lo tienes. Si no, ejecuta una vez la app **DSP1** desde el Homebrew Launcher: copia ese archivo desde tu propia consola.
 4. Opcional, para MSU-1: copia los `.pcm` de un pack a `sdmc:/3ds/mmx-3ds/`. No apliques ningún parche a la ROM.
 
@@ -40,7 +41,7 @@ git clone --recurse-submodules https://github.com/jzpgames/mmx-3ds.git
 cd mmx-3ds
 bash platform/3ds/apply-snesrecomp-patch.sh   # cambios del runtime para 3DS
 
-cp "/ruta/a/tu/Mega Man X (USA).sfc" mmx.sfc   # no se sube (está en .gitignore)
+cp "/ruta/a/Mega Man X (USA) (Rev 1).sfc" mmx.sfc   # no se sube (está en .gitignore)
 bash tools/regen.sh usa --no-tests             # genera src/gen desde tu ROM
 
 cd platform/3ds
