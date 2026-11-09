@@ -11,14 +11,13 @@ Necesitas tu propia ROM. Este repositorio no incluye la ROM, ni código generado
 - **Pantalla:** ancha nítida, 4:3 nítida o píxel exacto.
 - **Interfaz táctil** en la pantalla inferior: estados guardados, pantalla, sonido y rendimiento.
 - **Música MSU-1 opcional:** usa los packs estándar de Mega Man X, con volumen separado para música y efectos.
-- **Sprites que parpadean:** el tornado, el fuego y el parpadeo de X se ven completos a 30 imágenes por segundo.
 
 ## Instalar
 Descarga el zip desde **[Releases](../../releases)**. Adentro está el LEEME completo.
 
 1. Instala el `.cia` con FBI, o copia `3ds/mmx-3ds/` a la SD y abre el `.3dsx` desde el Homebrew Launcher.
 2. Copia tu ROM de **Mega Man X (USA)**, sin modificar, a `sdmc:/3ds/mmx-3ds/mmx.sfc`.
-3. Necesitas `sdmc:/3ds/dspfirm.cdc` para el audio (lo genera DSP1).
+3. Para tener sonido, la SD debe tener el archivo `sdmc:/3ds/dspfirm.cdc`. Si otros homebrew ya te suenan, lo tienes. Si no, ejecuta una vez la app **DSP1** desde el Homebrew Launcher: copia ese archivo desde tu propia consola.
 4. Opcional, para MSU-1: copia los `.pcm` de un pack a `sdmc:/3ds/mmx-3ds/`. No apliques ningún parche a la ROM.
 
 ## Controles
