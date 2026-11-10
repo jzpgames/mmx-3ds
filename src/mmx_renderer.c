@@ -56,7 +56,8 @@ void MmxRendererSetVramSnapshotReuse(bool enabled) { reuse_vram_snapshots = enab
 /* 3DS revision 3: the native PPU's own image ("stock") is only presented for
  * lines that the custom compositor does not draw. Hosts may let the PPU skip
  * pixel work for every other line, and for frames that will not be shown. */
-static bool stock_skipping, capture_enabled = true, frame_stage_scene, frame_select_scene;
+static bool stock_skipping, capture_enabled = true, frame_stage_scene, frame_select_scene, frame_flat_scene;
+static bool flat_native_scene(void);
 static bool stage_select_scene(void);
 #ifdef __3DS__
 static inline bool getenv_select_stock(void) { return false; }
@@ -97,8 +98,12 @@ static int view_camera(const uint8_t *r,unsigned address) {
 void MmxRendererHoldFrame(bool held) {frame_held=held;}
 static uint8_t partner_ram[0x20000];
 static Raster partner_raster;
+/* v1.0.1: VRAM of the hidden guest frame, double-buffered: the next hidden
+ * frame runs on the main thread while the composer still draws this one. */
+static Raster hidden_rasters[2];
+static Raster *hidden_draw; static unsigned hidden_stage;
 static const uint16_t *sprite_vram(const Raster *r) {
-  return r == &partner_raster ? r->vram : drawing_vram;
+  return (r == &partner_raster || r == hidden_draw) ? r->vram : drawing_vram;
 }
 static Piece building[MAX_PIECES], latched[MAX_PIECES];
 static unsigned building_count, latched_count;
@@ -496,6 +501,7 @@ void MmxRendererBeginFrame(const uint8_t ram[0x20000]) {
    * compositors too (their `select` lines); its stock pixels cost ~7 ms per
    * frame on the main thread and made that screen drop frames. */
   frame_select_scene = !frame_stage_scene && !getenv_select_stock() && stage_select_scene();
+  frame_flat_scene = !frame_stage_scene && !frame_select_scene && flat_native_scene();
   stock_lines_needed = 0;
   frame_zero = MmxZeroGetState();
   frame_bounds=MmxCoopViewsGetBoundsState();
@@ -729,7 +735,7 @@ bool MmxRendererSkipStockLine(const Ppu *p, unsigned line) {
    * mode-1 line of a stage scene themselves and never read its stock pixels.
    * frame_stage_scene is MmxWidePolicy_IsStageScene(frame.ram), the same
    * snapshot the compositors test. */
-  if (p && (frame_stage_scene || frame_select_scene) && (p->bgmode & 7) == 1) return true;
+  if (p && (frame_stage_scene || frame_select_scene || frame_flat_scene) && (p->bgmode & 7) == 1) return true;
   ++stock_lines_needed;
   return false;
 }
@@ -759,6 +765,17 @@ void MmxRendererCaptureLine(const Ppu *p, unsigned line) {
  * priority). Objects that merely changed animation were in the previous
  * shown frame and get no ghost. X (absent while blinking, $0BB6 == 0) is
  * added on alternate images: a 15 Hz blink instead of vanishing. */
+typedef struct FlickerObject { int x, y, size; uint16_t attr; } FlickerObject;
+static FlickerObject flicker_objects[128];
+static unsigned flicker_count;
+/* Hidden-phase sprites, under the shown frame's own sprites, with the
+ * hidden frame's tiles. Shared by both compositors. */
+static void draw_flicker_objects(const Ppu *p, int y, MmxRenderView view, uint16_t *objects,
+                                 int *object_colors);
+static void sprite(const Ppu *p, const Raster *r, int x, int sy, unsigned attr, int size,
+                   int y, MmxRenderView view, uint16_t *out, bool margins_only,
+                   const MmxSpriteAsset *asset, unsigned raw_tile, int *object_color,
+                   bool full_coordinates, unsigned zero_icon, bool red_tint);
 typedef struct OamSet { uint16_t oam[256]; uint8_t high[32]; uint8_t obsel; bool valid; } OamSet;
 static OamSet hidden_oam, previous_oam;
 static unsigned flicker_phase;
@@ -782,12 +799,13 @@ static bool oam_has_word(const OamSet *o, uint16_t word, int kind) {
 }
 void MmxRendererNoteHiddenFrame(const Ppu *p) {
   if (!p) { hidden_oam.valid = false; return; }
+  memcpy(hidden_rasters[hidden_stage].vram, p->vram, sizeof(hidden_rasters[0].vram));
   memcpy(hidden_oam.oam, p->oam, sizeof(hidden_oam.oam));
   memcpy(hidden_oam.high, p->highOam, sizeof(hidden_oam.high));
   hidden_oam.obsel = p->obsel; hidden_oam.valid = true;
 }
 static void merge_flicker_sprites(void) {
-  g_mmx_flicker_merged = 0;
+  g_mmx_flicker_merged = 0; flicker_count = 0;
   OamSet shown; Raster *first = &frame.lines[0];
   memcpy(shown.oam, first->oam, sizeof(shown.oam)); memcpy(shown.high, first->high_oam, sizeof(shown.high));
   shown.obsel = first->registers[offsetof(Ppu, obsel)]; shown.valid = true;
@@ -813,26 +831,33 @@ static void merge_flicker_sprites(void) {
     int x, y, size;
     if (oam_visible(&shown, k, &x, &y, &size) && X_PIECE(shown.oam[k * 2 + 1], x, y, size)) x_blinking = false;
   }
-  OamSet merged = shown; int free_slot = 127; bool changed = false;
+  flicker_count = 0;
   for (unsigned k = 0; k < 128; ++k) {
     int x, y, size, kind = oam_visible(&hidden_oam, k, &x, &y, &size);
     if (!kind) continue;
     uint16_t w = hidden_oam.oam[k * 2 + 1];
     if (oam_has_word(&shown, w, kind) || oam_has_word(&previous, w, kind)) continue;
-    if (x_blinking && (flicker_phase & 1) && X_PIECE(w, x, y, size)) continue;
-    while (free_slot >= 0 && oam_visible(&merged, (unsigned)free_slot, NULL, NULL, NULL)) --free_slot;
-    if (free_slot < 0) break;
-    unsigned f = (unsigned)free_slot--;
-    merged.oam[f * 2] = hidden_oam.oam[k * 2]; merged.oam[f * 2 + 1] = w;
-    unsigned hk = (hidden_oam.high[k / 4] >> ((k & 3) * 2)) & 3, sh = (f & 3) * 2;
-    merged.high[f / 4] = (uint8_t)((merged.high[f / 4] & ~(3u << sh)) | (hk << sh));
-    ++g_mmx_flicker_merged; changed = true;
+    /* X visible this frame: his hidden-phase pieces are an older pose. */
+    if (X_PIECE(w, x, y, size) && (!x_blinking || (flicker_phase & 1))) continue;
+    /* Slot order: drawn from high to low like OAM, all behind the shown
+     * frame's own sprites. */
+    flicker_objects[flicker_count++] = (FlickerObject){x, y, size, w};
+  }
+  g_mmx_flicker_merged = flicker_count;
+  if (flicker_count) {
+    hidden_draw = &hidden_rasters[hidden_stage];
+    memcpy(hidden_draw->palette, frame.lines[0].palette, sizeof(hidden_draw->palette));
+    hidden_stage ^= 1;
   }
 #undef X_PIECE
-  if (!changed) return;
-  for (unsigned y = 0; y < 224; ++y) {
-    memcpy(frame.lines[y].oam, merged.oam, sizeof(merged.oam));
-    memcpy(frame.lines[y].high_oam, merged.high, sizeof(merged.high));
+}
+static void draw_flicker_objects(const Ppu *p, int y, MmxRenderView view, uint16_t *objects,
+                                 int *object_colors) {
+  if (!hidden_draw) return;
+  for (int i = (int)flicker_count - 1; i >= 0; --i) {
+    const FlickerObject *o = &flicker_objects[i];
+    sprite(p, hidden_draw, o->x, o->y, o->attr, o->size, y, view, objects,
+        false, NULL, 0, object_colors, false, false, false);
   }
 }
 bool MmxRendererEndFrame(const uint32_t stock[256 * 224]) {
@@ -1366,6 +1391,13 @@ static bool window(const Ppu *p, int layer, int x, int extra) {
 static bool stage_select_scene(void) {
   return frame.ram[0xd1] == 2 && frame.ram[0xd2] == 0 && frame.ram[0xd3] == 1;
 }
+/* v1.0.1: the remaining mode-1 screens outside the stages (title, intro,
+ * password, menus) drawn flat by both compositors instead of copying the
+ * stock PPU's pixels. */
+static bool flat_native_scene(void) {
+  if (getenv_select_stock()) return false;
+  return frame.ram[0xd1] == 0 && frame.ram[0xd2] == 0 && frame.ram[0xd3] == 0;
+}
 unsigned MmxRendererStereoLayer(void) {
   return stage_select_scene() ? 1u : MmxStereoStageLayer(frame.ram[0x1f7a]);
 }
@@ -1455,24 +1487,48 @@ static bool bg1_select_depth_active(const Ppu *p) {
 }
 /* back[x - lo] = 1 when the BG1 block under screen column x has no
  * collision. y is the BG line (screen line + 1), as background() takes. */
+/* Collision code of the BG1 world block at (wx, wy); -1 outside the map. */
+static int bg1_block_code(const uint8_t *table, int wx, int wy) {
+  if (!table || wx < 0 || wy < 0 || wx >= 8192 || wy >= 8192) return -1;
+  unsigned screen = frame.ram[0xe800 + (wy >> 8) * 32 + (wx >> 8)];
+  unsigned address = (0x2000 + screen * 512 + ((wy & 0xf0) << 1) + ((wx & 0xf0) >> 3)) & 0xffff;
+  return table[word(frame.ram, address) & 0x3ff];
+}
+static inline bool bg1_ladder_code(int code) { return code == 0x12 || code == 0x13; }
 static void bg1_back_row(const Ppu *p, int y, int lo, int hi, uint8_t *back) {
   const uint8_t *table = bg1_collision_table();
   int wx0 = MmxDisplay_ExpandStageScroll((uint16_t)word(frame.ram, 0x1e4d), p->hScroll[0]);
   int wy = MmxDisplay_ExpandStageScroll((uint16_t)word(frame.ram, 0x1e50), p->vScroll[0]) + y;
+  /* v1.0.1: a block row is 16 lines tall, so consecutive lines usually ask
+   * for the same answer. Cached per finished frame and request. */
+  static uint8_t cache[1024]; static bool cache_valid;
+  static unsigned cache_generation; static const uint8_t *cache_table;
+  static int cache_wx0, cache_wy, cache_lo, cache_hi;
+  const bool cacheable = hi > lo && hi - lo <= (int)sizeof(cache);
+  if (cacheable && cache_valid && cache_generation == frame_generation && cache_table == table &&
+      cache_wx0 == wx0 && cache_wy == (wy >> 4) && cache_lo == lo && cache_hi == hi) {
+    memcpy(back, cache, (size_t)(hi - lo));
+    return;
+  }
   for (int x = lo; x < hi;) {
-    int wx = wx0 + x, span = 16 - (wx & 15);
+    int wx = wx0 + x, span = 8 - (wx & 7);
     if (x + span > hi) span = hi - x;
-    uint8_t value = 0;
-    if (table && wx >= 0 && wy >= 0 && wx < 8192 && wy < 8192) {
-      unsigned screen = frame.ram[0xe800 + (wy >> 8) * 32 + (wx >> 8)];
-      unsigned address = (0x2000 + screen * 512 + ((wy & 0xf0) << 1) + ((wx & 0xf0) >> 3)) & 0xffff;
-      unsigned code = table[word(frame.ram, address) & 0x3ff];
-      /* 0 = air, $0D = water (Launch Octopus): passable scenery. Slopes
-       * ($01-$0C) and solids ($36-$3F) are terrain. */
-      value = code == 0 || code == 0x0d;
-    }
+    /* 0 = air, $0D = water (Launch Octopus): passable scenery. Slopes
+     * ($01-$0C), ladders ($12/$13) and solids ($36-$3F) are terrain. */
+    int code = bg1_block_code(table, wx, wy);
+    uint8_t value = code == 0 || code == 0x0d;
+    /* v1.0.1: a ladder's rails overhang its 16-pixel block by up to 8
+     * pixels on each side (Spark Mandrill's dark shafts). Those columns stay
+     * with the ladder so it is never split between two depths. */
+    if (value && (bg1_ladder_code(bg1_block_code(table, wx - 8, wy)) ||
+                  bg1_ladder_code(bg1_block_code(table, wx + 8, wy)))) value = 0;
     memset(back + (x - lo), value, (size_t)span);
     x += span;
+  }
+  if (cacheable) {
+    memcpy(cache, back, (size_t)(hi - lo)); cache_valid = true;
+    cache_generation = frame_generation; cache_table = table;
+    cache_wx0 = wx0; cache_wy = wy >> 4; cache_lo = lo; cache_hi = hi;
   }
 }
 /* map[x] = source column for screen column x (x = 0..count-1 measured from
@@ -2139,6 +2195,7 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
   bool zero_title = zero_title_menu();
   bool stage = MmxWidePolicy_IsStageScene(frame.ram) && !menu;
   const bool select = !stage && !menu && stage_select_scene();
+  const bool flat = !stage && !menu && !select && flat_native_scene();
   bool rush_hud = stage && frame_rush.loaded;
   view_dx=view_dy=0;
   if(stage && peer_seat>=0 && frame_coop.initialized && MmxCoopViewsOnline()) {
@@ -2276,7 +2333,7 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
     drawing_vram = frame.lines[vram_owner[y]].vram;
     memcpy(&p, r->registers, PPU_SAVESTATE_REGS_SIZE);
     if (beam_count) p.cgwsel = (p.cgwsel & 0xcf) | 0x20;
-    if ((p.bgmode & 7) != 1 || (!stage && !menu && !zero_title && !frame_rush.menu && !select)) {
+    if ((p.bgmode & 7) != 1 || (!stage && !menu && !zero_title && !frame_rush.menu && !select && !flat)) {
       memcpy(out + y * view.width + view.extra, frame.stock + y * 256, 256 * sizeof(*out));
       ++stats.fallback_lines; continue;
     }
@@ -2322,6 +2379,8 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
     uint16_t objects[MMX_RENDER_MAX_WIDTH] = {0};
     int object_colors[MMX_RENDER_MAX_WIDTH];
     for (int x = 0; x < view.width; ++x) object_colors[x] = -1;
+    if (flicker_count && stage && (p.screenEnabled[0] | p.screenEnabled[1]) & 16)
+      draw_flicker_objects(&p, y, view, objects, object_colors);
     for (int i = (int)waiting_count - 1; i >= 0; --i) {
       Piece s = waiting[i];
       const MmxSpriteAsset *asset = s.animation == 0x53 ? waiting_zero : NULL;
@@ -2869,7 +2928,8 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
   door_cache_reset();
   if (stage) prepare_stage_planes();
   const bool select = !stage && stage_select_scene();
-  const int offset = frame_stereo_offset(MMX_STEREO_LEFT, amount);
+  const bool flat = !stage && !select && flat_native_scene();
+  const int offset = flat ? 0 : frame_stereo_offset(MMX_STEREO_LEFT, amount);
   const unsigned stereo_layer = MmxRendererStereoLayer(), stereo_mask = 1u << stereo_layer;
   const unsigned flat_layer = stereo_layer ^ 1u;
   window_cache_valid = false;
@@ -2881,7 +2941,7 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
     const Raster *r = &frame.lines[y]; Ppu p;
     memcpy(&p, r->registers, PPU_SAVESTATE_REGS_SIZE);
     uint32_t *out_l = left + y * 256, *out_r = right + y * 256;
-    if (!(stage || select) || (p.bgmode & 7) != 1) {
+    if (!(stage || select || flat) || (p.bgmode & 7) != 1) {
       memcpy(out_l, frame.stock + y * 256, 256 * sizeof(*out_l));
       if (out_r != out_l) memcpy(out_r, out_l, 256 * sizeof(*out_r));
       ++stats.fallback_lines; continue;
@@ -2955,14 +3015,18 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
       uint16_t *b1 = bg[0] + NATIVE_MARGIN;
       memcpy(row, b1, sizeof row);
       bg1_back_row(&p, y + 1, 0, 256, back);
-      bg1_priority_front(back, row, 256);
+      /* bg1_priority_front, the scenery test and the first half of
+       * bg1_remap's walk (nearest scenery column at or before each column)
+       * in one pass; the second half (at or after) follows. */
       bool scenery = false;
-      for (int x = 0; x < 256 && !scenery; ++x) scenery = back[x] && (row[x] & 255);
-      if (scenery) {
-      /* bg1_remap's walk from the sample toward x, as two lookups: the
-       * nearest scenery column at or before / at or after each column. */
       int last = -1;
-      for (int x = 0; x < 256; ++x) { if (back[x]) last = x; prev_back[x] = (int16_t)last; }
+      for (int x = 0; x < 256; ++x) {
+        unsigned v = row[x];
+        if ((v & 255) && (v & 0x4000)) back[x] = 0;
+        if (back[x]) { last = x; scenery |= (v & 255) != 0; }
+        prev_back[x] = (int16_t)last;
+      }
+      if (scenery) {
       last = 256;
       for (int x = 255; x >= 0; --x) { if (back[x]) last = x; next_back[x] = (int16_t)last; }
       /* The left eye's offset is never negative (frame_stereo_offset). */
@@ -2989,6 +3053,7 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
     }
     if (enabled & 16) {
       memset(objects, 0, sizeof(objects));
+      if (flicker_count && stage) draw_flicker_objects(&p, y, view, objects, object_colors);
       if (stable_objects) {
         for (unsigned i = 0; i < native_object_count[y]; ++i) {
           const NativeObject *s = &native_objects[native_object_rows[y][i]];

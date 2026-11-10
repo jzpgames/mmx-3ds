@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 static uint32_t eyes[256 * 224 * 2], ref[256 * 224 * 2];
 static unsigned verified, mismatched;
 extern unsigned g_ppu_debug_layer_mask;
@@ -31,8 +32,8 @@ typedef struct { unsigned frame; char op[8]; unsigned a, b; char s[16]; } Cmd;
 int main(int argc, char **argv) {
   char e[512]; if (!Mmx3dsLoad(argv[1], e, sizeof e)) { fprintf(stderr, "%s\n", e); return 1; }
   FILE *sf = fopen(argv[2], "r"); const char *out = argv[3];
-  static Cmd cmds[4096]; unsigned nc = 0; char line[256];
-  while (fgets(line, sizeof line, sf) && nc < 4096) {
+  static Cmd cmds[65536]; unsigned nc = 0; char line[256];
+  while (fgets(line, sizeof line, sf) && nc < 65536) {
     Cmd c = {0}; char a[32] = "", b[32] = "";
     if (sscanf(line, "%u %7s %31s %31s", &c.frame, c.op, a, b) < 2) continue;
     c.a = strtoul(a, NULL, 16); c.b = strtoul(b, NULL, 16); snprintf(c.s, sizeof c.s, "%s", a);
@@ -120,7 +121,11 @@ int main(int argc, char **argv) {
       if (audio_out && got) fwrite(pcm, 4, got, audio_out); }
     if (present && (shot || (n % 200) == 0)) {
       unsigned amt = getenv("AMOUNT") ? (unsigned)atoi(getenv("AMOUNT")) : MMX_STEREO_FULL;
-      Mmx3dsDrawPair(eyes, eyes + 256 * 224, amt);
+      struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+      int reps = getenv("TIME") ? atoi(getenv("TIME")) : 1;
+      for (int k = 0; k < reps; ++k) Mmx3dsDrawPair(eyes, eyes + 256 * 224, amt);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      if (getenv("TIME")) printf("TIME n=%u us=%.1f\n", n, ((t1.tv_sec - t0.tv_sec) * 1e9 + (t1.tv_nsec - t0.tv_nsec)) / 1e3 / reps);
       if (getenv("VERIFY")) {
         Mmx3dsDraw(ref, MMX_STEREO_LEFT, amt);
         Mmx3dsDraw(ref + 256 * 224, MMX_STEREO_RIGHT, amt);

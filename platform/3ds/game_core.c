@@ -245,11 +245,15 @@ typedef struct StateHeader {
   int64_t time;
   uint16_t thumb[MMX3DS_THUMB_W * MMX3DS_THUMB_H];
 } StateHeader;
-/* States only load into the build that wrote them: the snapshot layout
- * follows the runtime and the generated code. */
-static uint32_t build_id(void) {
-  static const char id[] = "mmx3ds-v1.0.0 " __DATE__ " " __TIME__;
-  return crc32_compute((const uint8_t *)id, sizeof id - 1) ^ (uint32_t)sizeof(StateHeader);
+/* States only load into a build with the same snapshot layout (it follows
+ * the runtime and the generated code). v1.0.1 changed presentation only, so
+ * it also accepts the states of the released v1.0.0 build. */
+static uint32_t state_id(const char *id) {
+  return crc32_compute((const uint8_t *)id, strlen(id)) ^ (uint32_t)sizeof(StateHeader);
+}
+static uint32_t build_id(void) { return state_id("mmx3ds-v1.0.1"); }
+static bool build_compatible(uint32_t build) {
+  return build == build_id() || build == state_id("mmx3ds-v1.0.0 Nov  9 2026 16:15:10");
 }
 uint8_t Mmx3dsStage(void) { return loaded ? g_ram[0x1f7a] : 0; }
 
@@ -299,7 +303,7 @@ bool Mmx3dsReadStateInfo(const char *path, Mmx3dsStateInfo *info) {
   FILE *f = fopen(path, "rb");
   if (!f) return false;
   StateHeader *h = malloc(sizeof *h);
-  bool ok = h && read_header(f, h) && h->build == build_id();
+  bool ok = h && read_header(f, h) && build_compatible(h->build);
   if (ok) {
     info->used = true; info->stage = h->stage; info->time = h->time;
     memcpy(info->thumb, h->thumb, sizeof info->thumb);
@@ -315,7 +319,7 @@ bool Mmx3dsLoadState(const char *path, char *error, size_t cap) {
   StateHeader *h = malloc(sizeof *h);
   void *blob = NULL;
   bool ok = h && read_header(f, h);
-  if (ok && h->build != build_id()) { ok = false; snprintf(error, cap, "Estado de otra version"); }
+  if (ok && !build_compatible(h->build)) { ok = false; snprintf(error, cap, "Estado de otra version"); }
   else if (!ok) snprintf(error, cap, "Archivo de estado invalido");
   if (ok) {
     blob = malloc(h->size);
