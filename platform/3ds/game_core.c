@@ -8,6 +8,9 @@
 #include <stddef.h>
 #include "mmx3ds_profile.h"
 #include "game_core.h"
+static bool english; /* 1.0.2: language of the messages below */
+void Mmx3dsSetEnglish(bool on) { english = on; }
+#define TR(es, en) (english ? (en) : (es))
 #include "common_cpu_infra.h"
 #include "common_rtl.h"
 #include "cpu_state.h"
@@ -89,31 +92,31 @@ static const RtlGameInfo info = {
 };
 
 bool Mmx3dsLoad(const char *path, char *error, size_t cap) {
-  if (loaded) { snprintf(error, cap, "El juego ya esta cargado."); return false; }
+  if (loaded) { snprintf(error, cap, TR("El juego ya esta cargado.", "The game is already loaded.")); return false; }
   FILE *f = fopen(path, "rb");
-  if (!f) { snprintf(error, cap, "No se pudo abrir mmx.sfc: %s", path); return false; }
+  if (!f) { snprintf(error, cap, TR("No se pudo abrir mmx.sfc: %s", "Could not open mmx.sfc: %s"), path); return false; }
   if (fseek(f, 0, SEEK_END)) { fclose(f); return false; }
   long bytes = ftell(f); rewind(f);
   if (bytes != 1572864 && bytes != 1573376) {
-    fclose(f); snprintf(error, cap, "ROM: se necesita Mega Man X USA Rev 1."); return false;
+    fclose(f); snprintf(error, cap, TR("ROM: se necesita Mega Man X USA Rev 1.", "ROM: Mega Man X USA Rev 1 is required.")); return false;
   }
   size_t size = 1572864;
   uint8_t *rom = malloc(size);
-  if (!rom) { fclose(f); snprintf(error, cap, "Sin memoria para la ROM."); return false; }
+  if (!rom) { fclose(f); snprintf(error, cap, TR("Sin memoria para la ROM.", "Not enough memory for the ROM.")); return false; }
   if (bytes == 1573376) fseek(f, 512, SEEK_SET);
   bool read_ok = fread(rom, 1, size, f) == size; fclose(f);
-  if (!read_ok) { free(rom); snprintf(error, cap, "Error al leer la ROM."); return false; }
+  if (!read_ok) { free(rom); snprintf(error, cap, TR("Error al leer la ROM.", "Could not read the ROM.")); return false; }
   uint8_t sha[32]; char hex[65]; sha256_compute(rom, size, sha);
   for (unsigned i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", sha[i]);
   if (strcmp(hex, "b8f70a6e7fb93819f79693578887e2c11e196bdf1ac6ddc7cb924b1ad0be2d32")) {
-    free(rom); snprintf(error, cap, "ROM diferente: usa USA Rev 1 sin modificaciones."); return false;
+    free(rom); snprintf(error, cap, TR("ROM diferente: usa USA Rev 1 sin modificaciones.", "Wrong ROM: use an unmodified USA Rev 1.")); return false;
   }
   RtlRegisterGame(&info);
   fprintf(stderr, "MMX3DS: ROM verified, SnesInit\n");
   Snes *snes = SnesInit(rom, (int)size);
   fprintf(stderr, "MMX3DS: SnesInit=%p\n", (void *)snes);
   free(rom);
-  if (!snes) { snprintf(error, cap, "No se pudo iniciar el runtime."); return false; }
+  if (!snes) { snprintf(error, cap, TR("No se pudo iniciar el runtime.", "Could not start the runtime.")); return false; }
   native_audio=true;
 #ifndef __3DS__
   native_audio=!(getenv("MMX_AUDIO_LEGACY")&&atoi(getenv("MMX_AUDIO_LEGACY")));
@@ -225,6 +228,29 @@ void Mmx3dsShutdown(void) {
   loaded = captured = false;
 }
 
+/* 1.0.2: inventory for the bottom-screen weapons page (RAM map of the USA
+ * Rev 1 game, checked against its own code: sub-tanks hold 14 units). */
+bool Mmx3dsReadStatus(Mmx3dsStatus *s) {
+  memset(s, 0, sizeof *s);
+  if (!loaded || !g_ram) return false;
+  /* $D1/$D2 = 2/4: inside a stage, including the pause menu, death and
+   * stage clear (the renderer's stage-scene test excludes the menu). */
+  s->valid = g_ram[0xd1] == 2 && g_ram[0xd2] == 4;
+  s->hp = g_ram[0xbcf]; s->hp_max = g_ram[0x1f9a]; s->lives = g_ram[0x1f80];
+  s->weapon = g_ram[0xbdb] >> 1;
+  for (int i = 0; i < 8; ++i) {
+    uint8_t v = g_ram[0x1f88 + 2 * i];
+    s->owned[i] = (v & 0x40) != 0; s->ammo[i] = v & 0x3f;
+  }
+  for (int i = 0; i < 4; ++i) {
+    uint8_t v = g_ram[0x1f83 + i];
+    s->tank_owned[i] = (v & 0x80) != 0; s->tank[i] = v & 0x0f;
+  }
+  for (unsigned b = g_ram[0x1f9c]; b; b &= b - 1) ++s->hearts;
+  s->upgrades = g_ram[0x1f99] & 0x0f;
+  return true;
+}
+
 void Mmx3dsLogState(FILE *f) {
   extern unsigned long long g_interp_bridge_bounces, g_interp_bridge_steps;
   if (!f) return;
@@ -269,13 +295,13 @@ void Mmx3dsMakeThumb(const uint32_t *image, uint16_t *thumb) {
 }
 
 bool Mmx3dsSaveState(const char *path, const uint16_t *thumb, char *error, size_t cap) {
-  if (!loaded) { snprintf(error, cap, "Juego no cargado"); return false; }
+  if (!loaded) { snprintf(error, cap, TR("Juego no cargado", "Game not loaded")); return false; }
   size_t capacity = RtlSaveSnapshotToMemory(NULL, 0);
   void *blob = capacity ? malloc(capacity) : NULL;
   size_t size = blob ? RtlSaveSnapshotToMemory(blob, capacity) : 0;
-  if (!size) { free(blob); snprintf(error, cap, "No se pudo capturar el estado"); return false; }
+  if (!size) { free(blob); snprintf(error, cap, TR("No se pudo capturar el estado", "Could not capture the state")); return false; }
   StateHeader *h = calloc(1, sizeof *h);
-  if (!h) { free(blob); snprintf(error, cap, "Sin memoria"); return false; }
+  if (!h) { free(blob); snprintf(error, cap, TR("Sin memoria", "Out of memory")); return false; }
   h->magic = STATE_MAGIC; h->version = STATE_VERSION; h->build = build_id();
   h->size = (uint32_t)size; h->crc = crc32_compute(blob, size);
   h->stage = g_ram[0x1f7a]; h->time = (int64_t)time(NULL);
@@ -288,7 +314,7 @@ bool Mmx3dsSaveState(const char *path, const uint16_t *thumb, char *error, size_
   if (f && fclose(f)) ok = false;
   free(blob); free(h);
   if (ok) { remove(path); ok = rename(temp, path) == 0; }
-  if (!ok) { remove(temp); snprintf(error, cap, "No se pudo escribir en la SD"); return false; }
+  if (!ok) { remove(temp); snprintf(error, cap, TR("No se pudo escribir en la SD", "Could not write to the SD card")); return false; }
   fprintf(stderr, "STATE saved %s bytes=%zu frame=%u stage=%02x\n", path, size, Mmx3dsFrame(), g_ram[0x1f7a]);
   return true;
 }
@@ -313,25 +339,25 @@ bool Mmx3dsReadStateInfo(const char *path, Mmx3dsStateInfo *info) {
 }
 
 bool Mmx3dsLoadState(const char *path, char *error, size_t cap) {
-  if (!loaded) { snprintf(error, cap, "Juego no cargado"); return false; }
+  if (!loaded) { snprintf(error, cap, TR("Juego no cargado", "Game not loaded")); return false; }
   FILE *f = fopen(path, "rb");
-  if (!f) { snprintf(error, cap, "Ranura vacia"); return false; }
+  if (!f) { snprintf(error, cap, TR("Ranura vacia", "Empty slot")); return false; }
   StateHeader *h = malloc(sizeof *h);
   void *blob = NULL;
   bool ok = h && read_header(f, h);
-  if (ok && !build_compatible(h->build)) { ok = false; snprintf(error, cap, "Estado de otra version"); }
-  else if (!ok) snprintf(error, cap, "Archivo de estado invalido");
+  if (ok && !build_compatible(h->build)) { ok = false; snprintf(error, cap, TR("Estado de otra version", "State from another version")); }
+  else if (!ok) snprintf(error, cap, TR("Archivo de estado invalido", "Invalid state file"));
   if (ok) {
     blob = malloc(h->size);
     ok = blob && fread(blob, 1, h->size, f) == h->size && crc32_compute(blob, h->size) == h->crc;
-    if (!ok) snprintf(error, cap, "Estado danado");
+    if (!ok) snprintf(error, cap, TR("Estado danado", "Damaged state"));
   }
   uint8_t msu[MMX3DS_MSU_STATE_SIZE];
   bool have_msu = ok && fread(msu, 1, sizeof msu, f) == sizeof msu;
   fclose(f);
   if (ok) {
     ok = RtlLoadSnapshotFromMemory(blob, h->size);
-    if (!ok) snprintf(error, cap, "El runtime rechazo el estado");
+    if (!ok) snprintf(error, cap, TR("El runtime rechazo el estado", "The runtime rejected the state"));
   }
   if (ok) {
     /* The old timeline's PCM must not be heard after the jump. */

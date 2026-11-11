@@ -6,6 +6,7 @@
 #include "framebuffer.h"
 #include "mmx_renderer.h"
 #include "ui.h"
+#include "logq.h"
 #include "msu3ds.h"
 #include <sys/stat.h>
 #include <time.h>
@@ -20,11 +21,16 @@ u32 __ctru_linear_heap_size = 4 * 1024 * 1024;
 
 static bool sound;
 
+/* 1.0.2: ZL/ZR also change weapons. With dash on L, L dashes like A and
+ * the previous weapon moves to ZL (R and ZR keep the next one). */
+static bool dash_on_l, stage_weapons = true, english;
+#define TR(es, en) (english ? (en) : (es))
 static uint16_t controller(u32 keys) {
   const u32 ctr[] = {KEY_B, KEY_Y, KEY_SELECT, KEY_START,
       KEY_DUP | KEY_CPAD_UP, KEY_DDOWN | KEY_CPAD_DOWN,
       KEY_DLEFT | KEY_CPAD_LEFT, KEY_DRIGHT | KEY_CPAD_RIGHT,
-      KEY_A, KEY_X, KEY_L, KEY_R};
+      dash_on_l ? KEY_A | KEY_L : KEY_A, KEY_X,
+      dash_on_l ? KEY_ZL : KEY_L | KEY_ZL, KEY_R | KEY_ZR};
   uint16_t snes = 0;
   for (unsigned i = 0; i < 12; ++i) if (keys & ctr[i]) snes |= 1u << i;
   return snes;
@@ -250,7 +256,7 @@ static void stop_worker(void) {
 }
 
 static void wait_exit(void) {
-  printf("\nPulsa START para salir.\n");
+  printf(TR("\nPulsa START para salir.\n", "\nPress START to exit.\n"));
   while (aptMainLoop()) {
     hidScanInput(); if (hidKeysDown() & KEY_START) break;
     gfxFlushBuffers();
@@ -271,21 +277,33 @@ static void apply_audio(void) {
   Mmx3dsMsuSetEnabled(msu_on); Mmx3dsMsuSetGains(music_vol, sfx_vol);
   UiSetAudio(Mmx3dsMsuTracks() > 0, msu_on, music_vol, sfx_vol);
 }
-static void load_settings(void) {
+/* ui.cfg: display, slot, msu, music, sfx (rev 18); language, dash on L,
+ * weapons page on stage start (1.0.2). Older files keep their bytes. */
+enum { CFG_SIZE = 8 };
+static size_t read_cfg(unsigned char cfg[CFG_SIZE]) {
+  const unsigned char defaults[CFG_SIZE] = {MMX3DS_DISPLAY_WIDE, 0, 1, 80, 100, 0, 0, 1};
+  memcpy(cfg, defaults, CFG_SIZE);
   FILE *f = fopen(DATA_DIR "/ui.cfg", "rb");
-  unsigned char cfg[5] = {MMX3DS_DISPLAY_WIDE, 0, 1, 80, 100};
-  if (f) { size_t n = fread(cfg, 1, 5, f); if (n < 2) cfg[0] = cfg[1] = 0;
-    if (n < 5) { cfg[2] = 1; cfg[3] = 80; cfg[4] = 100; } fclose(f); }
+  if (!f) return 0;
+  unsigned char got[CFG_SIZE]; size_t n = fread(got, 1, CFG_SIZE, f); fclose(f);
+  if (n >= 2) memcpy(cfg, got, n < 5 ? 2 : n);
+  return n;
+}
+static void apply_language(void) { UiSetLanguage(english); Mmx3dsSetEnglish(english); }
+static void load_settings(void) {
+  unsigned char cfg[CFG_SIZE]; read_cfg(cfg);
   display = cfg[0] < MMX3DS_DISPLAY_COUNT ? (Mmx3dsDisplay)cfg[0] : MMX3DS_DISPLAY_WIDE;
   UiSetDisplay(display); UiSetSelected(cfg[1] < UI_SLOTS ? cfg[1] : 0);
   msu_on = cfg[2] != 0; music_vol = cfg[3] <= 150 ? cfg[3] : 80; sfx_vol = cfg[4] <= 150 ? cfg[4] : 100;
-  apply_audio();
+  english = cfg[5] == 1; dash_on_l = cfg[6] == 1; stage_weapons = cfg[7] != 0;
+  apply_audio(); apply_language(); UiSetOptions(dash_on_l, stage_weapons);
 }
 static void save_settings(void) {
   FILE *f = fopen(DATA_DIR "/ui.cfg", "wb");
   if (!f) return;
-  unsigned char cfg[5] = {(unsigned char)display, (unsigned char)UiSelected(), msu_on, (unsigned char)music_vol, (unsigned char)sfx_vol};
-  fwrite(cfg, 1, 5, f); fclose(f);
+  unsigned char cfg[CFG_SIZE] = {(unsigned char)display, (unsigned char)UiSelected(), msu_on, (unsigned char)music_vol,
+                                 (unsigned char)sfx_vol, english, dash_on_l, stage_weapons};
+  fwrite(cfg, 1, CFG_SIZE, f); fclose(f);
 }
 static void refresh_slots(void) {
   for (int i = 0; i < UI_SLOTS; ++i) {
@@ -324,7 +342,7 @@ static void state_action(bool load, int slot) {
   if (sound) MmxAudioPause(false);
   fprintf(stderr, "STATE %s slot=%d ok=%d ms=%.1f %s\n", load ? "load" : "save", slot + 1, ok,
           ticks_us(svcGetSystemTick() - t) / 1000.0, ok ? "" : error);
-  if (ok) snprintf(message, sizeof message, "✓ %s ranura %d", load ? "Cargada" : "Guardado en", slot + 1);
+  if (ok) snprintf(message, sizeof message, load ? TR("✓ Cargada ranura %d", "✓ Loaded slot %d") : TR("✓ Guardado en ranura %d", "✓ Saved to slot %d"), slot + 1);
   else snprintf(message, sizeof message, "✗ %s", error);
   UiSetSelected(slot); save_settings();
   UiToast(message, ok, now_ms());
@@ -332,8 +350,10 @@ static void state_action(bool load, int slot) {
 
 int main(int argc, char **argv) {
   gfxInitDefault(); gfxSet3D(true); consoleInit(GFX_BOTTOM, NULL);
-  FILE *log = freopen("sdmc:/3ds/mmx-3ds/mmx-log.txt", "w", stderr);
-  if (log) setvbuf(log, NULL, _IOLBF, 4096);
+  if (!LogQueueStart("sdmc:/3ds/mmx-3ds/mmx-log.txt")) {
+    FILE *log = freopen("sdmc:/3ds/mmx-3ds/mmx-log.txt", "w", stderr);
+    if (log) setvbuf(log, NULL, _IOLBF, 4096);
+  }
   fprintf(stderr, "MMX3DS: main, stereo LCD ready\n");
   osSetSpeedupEnable(true);
   /* osSetSpeedupEnable has no return value. Record an explicit request so
@@ -345,21 +365,24 @@ int main(int argc, char **argv) {
   }
   fprintf(stderr, "BOOST new3ds=%d model_rc=%08lx request_rc=%08lx\n",
       new_model, (unsigned long)model_rc, (unsigned long)boost_rc);
-  printf("Mega Man X 3DS\nVersion experimental\n\nCargando ROM USA Rev 1...\n");
+  { unsigned char cfg[CFG_SIZE]; read_cfg(cfg); english = cfg[5] == 1; Mmx3dsSetEnglish(english); }
+  printf(TR("Mega Man X 3DS v1.0.2\nportado por jzpgames\n\nCargando ROM USA Rev 1...\n",
+            "Mega Man X 3DS v1.0.2\nported by jzpgames\n\nLoading ROM USA Rev 1...\n"));
   char rom[1024] = "sdmc:/3ds/mmx-3ds/mmx.sfc";
   if (argc > 0 && argv && argv[0]) {
     char *slash = strrchr(argv[0], '/');
     if (slash && (size_t)(slash - argv[0]) + sizeof("/mmx.sfc") < sizeof(rom))
       snprintf(rom, sizeof(rom), "%.*s/mmx.sfc", (int)(slash - argv[0]), argv[0]);
   }
-  char error[1024] = "Error al cargar el juego.";
+  char error[1024]; snprintf(error, sizeof error, "%s", TR("Error al cargar el juego.", "Could not load the game."));
   fprintf(stderr, "MMX3DS: loading %s\n", rom);
   if (!Mmx3dsLoad(rom, error, sizeof(error))) {
-    printf("\n%s\n\nColoca tu ROM USA Rev 1 como\nmmx.sfc junto al archivo 3dsx.\n", error);
-    wait_exit(); gfxExit(); return 1;
+    printf(TR("\n%s\n\nColoca tu ROM USA Rev 1 como\nmmx.sfc junto al archivo 3dsx.\n",
+              "\n%s\n\nPut your USA Rev 1 ROM as\nmmx.sfc next to the 3dsx file.\n"), error);
+    wait_exit(); LogQueueStop(); gfxExit(); return 1;
   }
   sound = MmxAudioStart();
-  if(!sound){printf("Audio NDSP no disponible. Revisa /3ds/dspfirm.cdc.\n");wait_exit();Mmx3dsShutdown();gfxExit();return 1;}
+  if(!sound){printf(TR("Audio NDSP no disponible. Revisa /3ds/dspfirm.cdc.\n","NDSP audio unavailable. Check /3ds/dspfirm.cdc.\n"));wait_exit();Mmx3dsShutdown();LogQueueStop();gfxExit();return 1;}
   MmxProfileEnable(false);
   fprintf(stderr, "MMX3DS: loaded, audio=%d\n", sound);
   consoleClear();
@@ -397,7 +420,7 @@ int main(int argc, char **argv) {
       if ((down & KEY_R) && !(keys & KEY_L)) {
         pending = UiSelected(); pending_load = true;
         if (!UiSlotUsed(pending)) {
-          char m[48]; snprintf(m, sizeof m, "✗ Ranura %d vacía", pending + 1);
+          char m[48]; snprintf(m, sizeof m, TR("✗ Ranura %d vacía", "✗ Slot %d is empty"), pending + 1);
           UiToast(m, false, now_ms()); pending = -1;
         }
       }
@@ -411,14 +434,14 @@ int main(int argc, char **argv) {
       else if (action.kind == UI_MUSIC_SOURCE) {
         if (msu_on != (action.arg != 0)) {
           msu_on = action.arg != 0; apply_audio(); save_settings();
-          UiToast(msu_on ? "MSU-1: próxima canción" : "SNES: próxima canción", true, now_ms());
+          UiToast(msu_on ? TR("MSU-1: próxima canción", "MSU-1: from the next song") : TR("SNES: próxima canción", "SNES: from the next song"), true, now_ms());
         }
       }
       else if (action.kind == UI_MUSIC_VOL || action.kind == UI_SFX_VOL) {
         unsigned *v = action.kind == UI_MUSIC_VOL ? &music_vol : &sfx_vol;
         int next = (int)*v + action.arg * 10; if (next < 0) next = 0; if (next > 150) next = 150;
         *v = (unsigned)next; apply_audio(); save_settings();
-        char m[48]; snprintf(m, sizeof m, "%s %u%%", action.kind == UI_MUSIC_VOL ? "Música" : "Efectos", *v);
+        char m[48]; snprintf(m, sizeof m, "%s %u%%", action.kind == UI_MUSIC_VOL ? TR("Música", "Music") : TR("Efectos", "Effects"), *v);
         UiToast(m, true, now_ms());
       }
       else if (action.kind == UI_PROFILE) { MmxProfileEnable(!g_mmx_profile_enabled); fprintf(stderr,"PROFILE enabled=%d\n",g_mmx_profile_enabled); }
@@ -428,9 +451,36 @@ int main(int argc, char **argv) {
         ndsp_drop_base=ndspGetDroppedFrames();
         MmxAudioResetMetrics();memset(&g_mmx_audio_core_metrics,0,sizeof g_mmx_audio_core_metrics);
         (void)MmxProfileTake();fprintf(stderr,"MEASUREMENT_RESET frame=%u profile=%d\n",Mmx3dsFrame(),g_mmx_profile_enabled);
-        audio_issue_base=0;UiToast("✓ Mediciones reiniciadas", true, now_ms());}
+        audio_issue_base=0;UiToast(TR("✓ Mediciones reiniciadas","✓ Measurements reset"), true, now_ms());}
+      else if (action.kind == UI_LANGUAGE) {
+        english = action.arg != 0; apply_language(); save_settings();
+        UiToast(english ? "✓ English" : "✓ Español", true, now_ms());
+      }
+      else if (action.kind == UI_DASH) {
+        dash_on_l = action.arg != 0; UiSetOptions(dash_on_l, stage_weapons); save_settings();
+        UiToast(dash_on_l ? TR("✓ Dash con L y A", "✓ Dash with L and A") : TR("✓ Dash con A", "✓ Dash with A"), true, now_ms());
+      }
+      else if (action.kind == UI_STAGE_PANEL) {
+        stage_weapons = action.arg != 0; UiSetOptions(dash_on_l, stage_weapons); save_settings();
+        UiToast(TR("✓ Guardado", "✓ Saved"), true, now_ms());
+      }
     }
     if (pending >= 0) { state_action(pending_load, pending); pending = -1; }
+    /* 1.0.2: weapons page. A stage that starts after more than two seconds
+     * outside one (not a respawn) shows it; leaving for longer goes back. */
+    {
+      static unsigned outside = 0; static bool switched = false;
+      Mmx3dsStatus st; Mmx3dsReadStatus(&st); UiSetStatus(&st);
+      if (st.valid) {
+        if (outside > 60 && stage_weapons && UiPage() == UI_PAGE_MENU && !UiDetailVisible()) {
+          UiSetPage(UI_PAGE_WEAPONS); switched = true;
+        }
+        outside = 0;
+      } else if (++outside == 60 && switched) {
+        if (UiPage() == UI_PAGE_WEAPONS) UiSetPage(UI_PAGE_MENU);
+        switched = false;
+      }
+    }
     present_ui();
     uint16_t pad = controller((keys & KEY_SELECT) ? keys & ~(KEY_L | KEY_R) : keys);
     u64 pair_start = svcGetSystemTick(); double pair_wait = 0, pair_periods = 0;
@@ -488,6 +538,13 @@ int main(int argc, char **argv) {
       u32 images = images_now - images_start;
       double stereo = images ? (stereo_now - stereo_start) / 1000.0 / images : 0;
       double lcd = images ? (lcd_now - lcd_start) / 1000.0 / images : 0;
+      /* 1.0.2: BG1 depth under Launch Octopus' water costs the composer
+       * up to 34 ms per image. Withdraw it while the last second ran over
+       * 28.5 ms; bring it back once a cheaper area is under 21 ms. */
+      if (images && (MmxRendererHeavyBg1Depth() ? stereo > 28.5 : stereo < 21.0)) {
+        MmxRendererAllowHeavyBg1Depth(!MmxRendererHeavyBg1Depth());
+        fprintf(stderr, "DEPTH heavy_bg1=%d stereo_ms=%.1f\n", MmxRendererHeavyBg1Depth(), stereo);
+      }
       double cpu = cpu_ms / measured_guest, ppu = ppu_ms / measured_guest;
       double wait = pairs ? wait_ms / pairs : 0;
       MmxProfileStats subs=MmxProfileTake();
@@ -497,19 +554,21 @@ int main(int argc, char **argv) {
       if(peak3d>lifetime_stereo_peak)lifetime_stereo_peak=peak3d;
       {
         static char lines[UI_DETAIL_LINES][UI_LINE];
-        static const char *names[]={"Juego ","Puente","SPC   ","DSP   ","PPU   ","PCM   "};
+        static const char *names_es[]={"Juego ","Puente","SPC   ","DSP   ","PPU   ","PCM   "};
+        static const char *names_en[]={"Game  ","Bridge","SPC   ","DSP   ","PPU   ","PCM   "};
+        const char *const *names=english?names_en:names_es;
         memset(lines,0,sizeof lines);
-        snprintf(lines[0],UI_LINE,"Juego %.1f  Imagen %.1f FPS  (%s)",(Mmx3dsFrame()-fps_guest_start)/seconds,images/seconds,render_mode);
-        snprintf(lines[1],UI_LINE,"3D %u%%  capa BG%u  +/- %u px",amount*100/MMX_STEREO_FULL,worker_depth_layer,worker_depth_pixels);
-        snprintf(lines[2],UI_LINE,"CPU %.1f  PPU %.1f  3D %.1f  LCD %.1f  espera %.1f ms",cpu,ppu,stereo,lcd,wait);
-        snprintf(lines[3],UI_LINE,"Pico juego %.1f  3D %.1f   Max juego %.1f  3D %.1f",main_peak_ms,peak3d/1000.0,lifetime_main_peak,lifetime_stereo_peak/1000.0);
-        snprintf(lines[4],UI_LINE,"VBlank sin imagen %lu",(unsigned long)(held_vblanks-held_base));
-        snprintf(lines[5],UI_LINE,"Audio U:%u O:%u perdidas:%u",audio.underruns+(unsigned)g_mmx_audio_core_metrics.render_underruns,audio.overruns,audio.dropped+(unsigned)g_mmx_audio_core_metrics.dsp_dropped);
-        snprintf(lines[6],UI_LINE,"Cola %.0f ms (min %.0f)  %s %+.3f%%  %s",audio.queued*1000.0/audio.rate,audio.min_queued*1000.0/audio.rate,audio.polyphase?"Polifase":"Lineal",audio.correction*100,audio.priming?"cargando":"activo");
-        snprintf(lines[7],UI_LINE,"Desglose CPU %s (medio / max por paso)",g_mmx_profile_enabled?"SÍ":"NO");
+        snprintf(lines[0],UI_LINE,TR("Juego %.1f  Imagen %.1f FPS  (%s)","Game %.1f  Image %.1f FPS  (%s)"),(Mmx3dsFrame()-fps_guest_start)/seconds,images/seconds,render_mode);
+        snprintf(lines[1],UI_LINE,TR("3D %u%%  capa BG%u  +/- %u px","3D %u%%  layer BG%u  +/- %u px"),amount*100/MMX_STEREO_FULL,worker_depth_layer,worker_depth_pixels);
+        snprintf(lines[2],UI_LINE,TR("CPU %.1f  PPU %.1f  3D %.1f  LCD %.1f  espera %.1f ms","CPU %.1f  PPU %.1f  3D %.1f  LCD %.1f  wait %.1f ms"),cpu,ppu,stereo,lcd,wait);
+        snprintf(lines[3],UI_LINE,TR("Pico juego %.1f  3D %.1f   Max juego %.1f  3D %.1f","Peak game %.1f  3D %.1f   Max game %.1f  3D %.1f"),main_peak_ms,peak3d/1000.0,lifetime_main_peak,lifetime_stereo_peak/1000.0);
+        snprintf(lines[4],UI_LINE,TR("VBlank sin imagen %lu","VBlanks without image %lu"),(unsigned long)(held_vblanks-held_base));
+        snprintf(lines[5],UI_LINE,TR("Audio U:%u O:%u perdidas:%u","Audio U:%u O:%u lost:%u"),audio.underruns+(unsigned)g_mmx_audio_core_metrics.render_underruns,audio.overruns,audio.dropped+(unsigned)g_mmx_audio_core_metrics.dsp_dropped);
+        snprintf(lines[6],UI_LINE,TR("Cola %.0f ms (min %.0f)  %s %+.3f%%  %s","Queue %.0f ms (min %.0f)  %s %+.3f%%  %s"),audio.queued*1000.0/audio.rate,audio.min_queued*1000.0/audio.rate,audio.polyphase?TR("Polifase","Polyphase"):TR("Lineal","Linear"),audio.correction*100,audio.priming?TR("cargando","priming"):TR("activo","running"));
+        snprintf(lines[7],UI_LINE,TR("Desglose CPU %s (medio / max por paso)","CPU breakdown %s (mean / max per step)"),g_mmx_profile_enabled?TR("SÍ","ON"):TR("NO","OFF"));
         for(unsigned c=0;c<MMXP_COUNT&&8+c<UI_DETAIL_LINES-1;++c)
           snprintf(lines[8+c],UI_LINE,"  %s %6.2f / %6.2f ms",names[c],subs.frames?subs.ms[c]/subs.frames:0,subs.peak_ms[c]);
-        snprintf(lines[UI_DETAIL_LINES-2],UI_LINE,"Reloj %.0f ns  lecturas %llu",subs.clock_ns,(unsigned long long)subs.reads);
+        snprintf(lines[UI_DETAIL_LINES-2],UI_LINE,TR("Reloj %.0f ns  lecturas %llu","Clock %.0f ns  reads %llu"),subs.clock_ns,(unsigned long long)subs.reads);
         UiSetDetail(lines);
         u32 issues=audio.underruns+audio.dropped+(u32)g_mmx_audio_core_metrics.render_underruns+(u32)g_mmx_audio_core_metrics.dsp_dropped;
         UiStats st={(float)(images/seconds),amount*100/MMX_STEREO_FULL,(float)((cpu+ppu)*2),(float)stereo,
@@ -534,6 +593,6 @@ int main(int argc, char **argv) {
   aptUnhook(&apt_cookie);
   if (sound) MmxAudioStop();
   Mmx3dsShutdown();
-  if (!ok) { consoleClear(); printf("\nEl runtime se detuvo.\n"); wait_exit(); }
-  gfxExit(); return ok ? 0 : 1;
+  if (!ok) { consoleClear(); printf(TR("\nEl runtime se detuvo.\n", "\nThe runtime stopped.\n")); wait_exit(); }
+  LogQueueStop(); gfxExit(); return ok ? 0 : 1;
 }

@@ -133,6 +133,10 @@ bool MmxRendererEndFrame(const uint32_t stock[256 * 224]);
 /* v1.0.1: OAM of a guest frame that is run but not shown (30 Hz pairs). */
 void MmxRendererNoteHiddenFrame(const Ppu *p);
 extern unsigned g_mmx_flicker_merged;
+/* 1.0.2: BG1 depth under subscreen blending (Launch Octopus' water). The
+ * 3DS loop turns it off while the composer overruns its budget. */
+void MmxRendererAllowHeavyBg1Depth(bool allowed);
+bool MmxRendererHeavyBg1Depth(void);
 bool MmxRendererDraw(uint32_t *output, MmxRenderView view, bool anchor_hud);
 /* Draw each eye from the SAME Begin/Capture/EndFrame snapshot. Never advance
  * the guest between calls. amount is 0..MMX_STEREO_FULL (clamped).

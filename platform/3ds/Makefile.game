@@ -62,7 +62,7 @@ endif
 SOURCES := $(addprefix $(ROOT)/src/,$(addsuffix .c,$(GAME_NAMES))) \
   $(addprefix $(RUNTIME)/,$(addsuffix .c,$(RUNTIME_NAMES))) \
   $(addprefix $(RUNTIME)/snes/,$(addsuffix .c,$(SNES_NAMES))) \
-  $(GEN) $(FIBER) $(DEVICE) game_core.c game_services.c msu3ds.c subsystem_profile.c audio_queue.c native_audio.c framebuffer.c $(UI) $(ENTRY).c
+  $(GEN) $(FIBER) $(DEVICE) game_core.c game_services.c msu3ds.c subsystem_profile.c audio_queue.c native_audio.c framebuffer.c $(UI) $(if $(filter 1,$(HOST)),,logq.c) $(ENTRY).c
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(basename $(notdir $(SOURCES)))))
 vpath %.c $(sort $(dir $(SOURCES)))
 .DEFAULT_GOAL := all

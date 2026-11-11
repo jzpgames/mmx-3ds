@@ -8,14 +8,14 @@ typedef struct UiGlyph { uint16_t code; uint8_t w; uint16_t adv64; uint32_t offs
 typedef struct UiFont { uint8_t h; uint16_t count; const UiGlyph *glyphs; const uint8_t *alpha; } UiFont;
 
 extern const UiImage ui_thumb_empty;
-extern const UiImage ui_seg0;
-extern const UiImage ui_seg1;
-extern const UiImage ui_seg2;
 extern const UiImage ui_btn_save;
 extern const UiImage ui_btn_load;
 extern const UiImage ui_btn_load_off;
 extern const UiImage ui_btn_save_hot;
 extern const UiImage ui_btn_load_hot;
+extern const UiImage ui_seg0;
+extern const UiImage ui_seg1;
+extern const UiImage ui_seg2;
 extern const UiImage ui_vol_full;
 extern const UiImage ui_aseg_snes;
 extern const UiImage ui_aseg_msu;
@@ -35,8 +35,84 @@ extern const UiImage ui_card2;
 extern const UiImage ui_card0_sel;
 extern const UiImage ui_card1_sel;
 extern const UiImage ui_card2_sel;
+extern const UiImage ui_hp_full;
+extern const UiImage ui_wfull0;
+extern const UiImage ui_wfull1;
+extern const UiImage ui_wfull2;
+extern const UiImage ui_wfull3;
+extern const UiImage ui_wfull4;
+extern const UiImage ui_wfull5;
+extern const UiImage ui_wfull6;
+extern const UiImage ui_wfull7;
+extern const UiImage ui_tfull;
+extern const UiImage ui_hp_track;
+extern const UiImage ui_up_on0;
+extern const UiImage ui_up_on1;
+extern const UiImage ui_up_on2;
+extern const UiImage ui_up_on3;
+extern const UiImage ui_ol0;
+extern const UiImage ui_ol1;
+extern const UiImage ui_od0;
+extern const UiImage ui_od1;
+extern const UiImage ui_op0;
+extern const UiImage ui_op1;
 extern const UiImage ui_bg_main;
 extern const UiImage ui_bg_detail;
+extern const UiImage ui_bg_hud;
+extern const UiImage ui_bg_opts;
+extern const UiImage ui_thumb_empty_en;
+extern const UiImage ui_btn_save_en;
+extern const UiImage ui_btn_load_en;
+extern const UiImage ui_btn_load_off_en;
+extern const UiImage ui_btn_save_hot_en;
+extern const UiImage ui_btn_load_hot_en;
+extern const UiImage ui_seg0_en;
+extern const UiImage ui_seg1_en;
+extern const UiImage ui_seg2_en;
+extern const UiImage ui_vol_full_en;
+extern const UiImage ui_aseg_snes_en;
+extern const UiImage ui_aseg_msu_en;
+extern const UiImage ui_aseg_none_en;
+extern const UiImage ui_mini_ok_en;
+extern const UiImage ui_mini_cyan_en;
+extern const UiImage ui_mini_warn_en;
+extern const UiImage ui_mini_bad_en;
+extern const UiImage ui_chip_ok_en;
+extern const UiImage ui_chip_cyan_en;
+extern const UiImage ui_toast_ok_en;
+extern const UiImage ui_chip_warn_en;
+extern const UiImage ui_toast_err_en;
+extern const UiImage ui_card0_en;
+extern const UiImage ui_card1_en;
+extern const UiImage ui_card2_en;
+extern const UiImage ui_card0_sel_en;
+extern const UiImage ui_card1_sel_en;
+extern const UiImage ui_card2_sel_en;
+extern const UiImage ui_hp_full_en;
+extern const UiImage ui_wfull0_en;
+extern const UiImage ui_wfull1_en;
+extern const UiImage ui_wfull2_en;
+extern const UiImage ui_wfull3_en;
+extern const UiImage ui_wfull4_en;
+extern const UiImage ui_wfull5_en;
+extern const UiImage ui_wfull6_en;
+extern const UiImage ui_wfull7_en;
+extern const UiImage ui_tfull_en;
+extern const UiImage ui_hp_track_en;
+extern const UiImage ui_up_on0_en;
+extern const UiImage ui_up_on1_en;
+extern const UiImage ui_up_on2_en;
+extern const UiImage ui_up_on3_en;
+extern const UiImage ui_ol0_en;
+extern const UiImage ui_ol1_en;
+extern const UiImage ui_od0_en;
+extern const UiImage ui_od1_en;
+extern const UiImage ui_op0_en;
+extern const UiImage ui_op1_en;
+extern const UiImage ui_bg_main_en;
+extern const UiImage ui_bg_detail_en;
+extern const UiImage ui_bg_hud_en;
+extern const UiImage ui_bg_opts_en;
 
 #define UI_R_MAIN ((UiRect){0, 0, 320, 240})
 #define UI_R_CHIPF ((UiRect){216, 6, 46, 12})
@@ -75,9 +151,9 @@ extern const UiImage ui_bg_detail;
 #define UI_R_VMB ((UiRect){60, 187, 59, 5})
 #define UI_R_VEB ((UiRect){60, 201, 59, 5})
 #define UI_R_PERF ((UiRect){146, 153, 166, 58})
-#define UI_R_PB0 ((UiRect){174, 171, 94, 4})
-#define UI_R_PB1 ((UiRect){174, 182, 94, 4})
-#define UI_R_PB2 ((UiRect){174, 193, 94, 4})
+#define UI_R_PB0 ((UiRect){178, 171, 90, 4})
+#define UI_R_PB1 ((UiRect){178, 182, 90, 4})
+#define UI_R_PB2 ((UiRect){178, 193, 90, 4})
 #define UI_R_PV0 ((UiRect){272, 169, 34, 8})
 #define UI_R_PV1 ((UiRect){272, 180, 34, 8})
 #define UI_R_PV2 ((UiRect){272, 191, 34, 8})
@@ -87,6 +163,60 @@ extern const UiImage ui_bg_detail;
 #define UI_R_BP ((UiRect){89, 198, 77, 22})
 #define UI_R_BR ((UiRect){169, 198, 77, 22})
 #define UI_R_BK ((UiRect){250, 198, 62, 22})
+#define UI_R_TAB0 ((UiRect){8, 225, 99, 13})
+#define UI_R_TAB1 ((UiRect){110, 225, 99, 13})
+#define UI_R_TAB2 ((UiRect){213, 225, 99, 13})
+#define UI_R_HTOAST ((UiRect){100, 7, 110, 10})
+#define UI_R_HPH ((UiRect){8, 29, 187, 28})
+#define UI_R_HPV ((UiRect){158, 33, 31, 10})
+#define UI_R_HPT ((UiRect){14, 46, 160, 7})
+#define UI_R_LV ((UiRect){294, 33, 12, 10})
+#define UI_R_HV ((UiRect){286, 45, 20, 10})
+#define UI_R_W0 ((UiRect){8, 72, 150, 22})
+#define UI_R_W1 ((UiRect){162, 72, 150, 22})
+#define UI_R_W2 ((UiRect){8, 97, 150, 22})
+#define UI_R_W3 ((UiRect){162, 97, 150, 22})
+#define UI_R_W4 ((UiRect){8, 122, 150, 22})
+#define UI_R_W5 ((UiRect){162, 122, 150, 22})
+#define UI_R_W6 ((UiRect){8, 147, 150, 22})
+#define UI_R_W7 ((UiRect){162, 147, 150, 22})
+#define UI_R_WV0 ((UiRect){140, 75, 11, 10})
+#define UI_R_WV1 ((UiRect){295, 75, 11, 10})
+#define UI_R_WV2 ((UiRect){140, 100, 11, 10})
+#define UI_R_WV3 ((UiRect){295, 100, 11, 10})
+#define UI_R_WV4 ((UiRect){140, 125, 11, 10})
+#define UI_R_WV5 ((UiRect){295, 125, 11, 10})
+#define UI_R_WV6 ((UiRect){140, 150, 11, 10})
+#define UI_R_WV7 ((UiRect){295, 150, 11, 10})
+#define UI_R_WB0 ((UiRect){14, 87, 138, 5})
+#define UI_R_WB1 ((UiRect){168, 87, 138, 5})
+#define UI_R_WB2 ((UiRect){14, 112, 138, 5})
+#define UI_R_WB3 ((UiRect){168, 112, 138, 5})
+#define UI_R_WB4 ((UiRect){14, 137, 138, 5})
+#define UI_R_WB5 ((UiRect){168, 137, 138, 5})
+#define UI_R_WB6 ((UiRect){14, 162, 138, 5})
+#define UI_R_WB7 ((UiRect){168, 162, 138, 5})
+#define UI_R_KB0 ((UiRect){26, 189, 56, 6})
+#define UI_R_KB1 ((UiRect){123, 189, 56, 6})
+#define UI_R_KB2 ((UiRect){26, 202, 56, 6})
+#define UI_R_KB3 ((UiRect){123, 202, 56, 6})
+#define UI_R_KV0 ((UiRect){85, 188, 20, 8})
+#define UI_R_KV1 ((UiRect){182, 188, 20, 8})
+#define UI_R_KV2 ((UiRect){85, 201, 20, 8})
+#define UI_R_KV3 ((UiRect){182, 201, 20, 8})
+#define UI_R_U0 ((UiRect){219, 187, 42, 11})
+#define UI_R_U1 ((UiRect){264, 187, 42, 11})
+#define UI_R_U2 ((UiRect){219, 201, 42, 11})
+#define UI_R_U3 ((UiRect){264, 201, 42, 11})
+#define UI_R_OL ((UiRect){8, 40, 304, 28})
+#define UI_R_OL0 ((UiRect){11, 43, 148, 22})
+#define UI_R_OL1 ((UiRect){161, 43, 148, 22})
+#define UI_R_OD ((UiRect){8, 81, 304, 28})
+#define UI_R_OD0 ((UiRect){11, 84, 148, 22})
+#define UI_R_OD1 ((UiRect){161, 84, 148, 22})
+#define UI_R_OP ((UiRect){8, 122, 304, 28})
+#define UI_R_OP0 ((UiRect){11, 125, 148, 22})
+#define UI_R_OP1 ((UiRect){161, 125, 148, 22})
 
 extern const UiFont ui_font_meta;
 extern const UiFont ui_font_metab;
@@ -94,3 +224,4 @@ extern const UiFont ui_font_btn;
 extern const UiFont ui_font_chip;
 extern const UiFont ui_font_name;
 extern const UiFont ui_font_big;
+extern const UiFont ui_font_val;

@@ -5,11 +5,15 @@ Port no oficial de **Mega Man X (SNES)** para **New Nintendo 3DS / New 3DS XL / 
 Necesitas tu propia ROM de **Mega Man X (USA) Rev 1 (v1.1)**. Este repositorio no incluye la ROM, ni código generado a partir de ella, ni música.
 
 ## Características
-- **3D estereoscópico:** los fondos tienen profundidad en todas las fases, en las salas de jefes y en la selección de etapas. Con el deslizador abajo, la imagen es idéntica al original.
+- **3D estereoscópico:** los fondos tienen profundidad en todas las fases, en las salas de jefes, en la selección de etapas y en la contraseña. Con el deslizador abajo, la imagen es idéntica al original.
 - **30 imágenes por segundo estables**, con la lógica del juego a 60 Hz.
 - **Savestates:** 3 ranuras con miniatura, guardado y carga rápidos con SELECT + L/R.
 - **Pantalla:** ancha nítida, 4:3 nítida o píxel exacto.
-- **Interfaz táctil** en la pantalla inferior: estados guardados, pantalla, sonido y rendimiento.
+- **Interfaz táctil** en la pantalla inferior, con tres pestañas:
+  - **MENÚ:** estados guardados, pantalla, sonido y rendimiento.
+  - **ARMAS:** vida, corazones, munición de cada arma, sub-tanques y mejoras, en vivo durante las fases.
+  - **OPCIONES:** idioma, botón de dash y atajos.
+- **Español o inglés** en la pantalla inferior y los mensajes.
 - **Música MSU-1 opcional:** usa los packs estándar de Mega Man X, con volumen separado para música y efectos.
 
 ## Instalar
@@ -24,11 +28,21 @@ Descarga el zip desde **[Releases](../../releases)**. Adentro está el LEEME com
 ## Controles
 - **B:** saltar
 - **Y:** disparar (mantén para cargar)
-- **A:** dash
-- **L / R:** cambiar arma
+- **A:** dash (opcional: también **L**)
+- **L / R** o **ZL / ZR:** cambiar arma (con dash en L, el arma anterior pasa a ZL)
 - **START:** menú
 - **SELECT + L / R:** guardado y carga rápidos
 - **L + R + START + SELECT:** salir
+
+## English
+Unofficial port of **Mega Man X (SNES)** to the **New Nintendo 3DS / New 3DS XL / New 2DS XL**. It is not an emulator: the game is recompiled and runs natively.
+
+- Stereoscopic 3D in every stage, boss room, the stage select and the password screen; a steady 30 FPS.
+- Save states, sharp wide / 4:3 / pixel display, optional MSU-1 music.
+- Touch bottom screen with a live WEAPONS page (life, heart tanks, ammo, sub tanks, upgrades).
+- Spanish or English (bottom screen → OPCIONES → ENGLISH). Optional dash on L, ZL / ZR change weapons.
+
+You need your own unmodified **Mega Man X (USA) Rev 1 (v1.1)** ROM (headerless CRC32 `DED53C64`) at `sdmc:/3ds/mmx-3ds/mmx.sfc`, and `sdmc:/3ds/dspfirm.cdc` for sound. Download the zip from **[Releases](../../releases)**; `README-EN.md` inside has the full instructions.
 
 ## Compilar
 **Requisitos:**

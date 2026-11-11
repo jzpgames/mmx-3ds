@@ -1398,8 +1398,30 @@ static bool flat_native_scene(void) {
   if (getenv_select_stock()) return false;
   return frame.ram[0xd1] == 0 && frame.ram[0xd2] == 0 && frame.ram[0xd3] == 0;
 }
+/* 1.0.2: the password screen. Everything but the text and the digits is
+ * BG1: the machinery around the panel (palette 3) and the panel itself
+ * (palette 2, with palette-3 digit boxes inside). On each line the
+ * palette-3 runs that reach the screen edges are the machinery; it is moved
+ * to the empty BG2 and drawn at the scene-plane depth, the panel stays at
+ * the screen. $D7-$D9 hold the screen's handler while it is up. */
+static bool password_scene(void) {
+  return flat_native_scene() && frame.ram[0xd7] == 0xce && frame.ram[0xd8] == 0x03 &&
+      frame.ram[0xd9] == 0xe0;
+}
+static inline bool password_machinery(uint16_t v) { return !(v & 255) || (v & 0x70) == 0x30; }
+static void password_back(const uint16_t *row, uint8_t back[256]) {
+  memset(back, 0, 256);
+  int x = 0;
+  while (x < 256 && password_machinery(row[x])) back[x++] = 1;
+  for (int k = 255; k >= x && password_machinery(row[k]); --k) back[k] = 1;
+}
+/* A BG1 pixel recoded as a low-priority BG2 pixel (the native code layout). */
+static inline uint16_t password_plane(uint16_t v) {
+  return v & 255 ? (uint16_t)((7u << 12) | (1u << 8) | (v & 255)) : 0;
+}
+static bool password_depth_line(const Ppu *p) { return (p->screenEnabled[0] & 3) == 3; }
 unsigned MmxRendererStereoLayer(void) {
-  return stage_select_scene() ? 1u : MmxStereoStageLayer(frame.ram[0x1f7a]);
+  return stage_select_scene() || password_scene() ? 1u : MmxStereoStageLayer(frame.ram[0x1f7a]);
 }
 static bool stereo_plane_allowed(const Ppu *p) {
   unsigned mask = 1u << MmxRendererStereoLayer();
@@ -1436,16 +1458,26 @@ static const uint8_t *bg1_collision_table(void) {
  * it off (3% with hysteresis to turn it back off once on). */
 static bool bg1_frame_state;
 static unsigned bg1_frame_generation = UINT_MAX;
+static bool bg1_heavy_allowed = true;
+void MmxRendererAllowHeavyBg1Depth(bool allowed) { bg1_heavy_allowed = allowed; }
+bool MmxRendererHeavyBg1Depth(void) { return bg1_heavy_allowed; }
 static bool bg1_frame_depth(void) {
   if (bg1_frame_generation == frame_generation) return bg1_frame_level > 0;
   bg1_frame_generation = frame_generation;
   const uint16_t *saved = drawing_vram;
-  unsigned total = 0, visible = 0;
+  unsigned total = 0, visible = 0, lines = 0, blended = 0;
   for (int y = 8; y < 224; y += 16) {
     const Raster *r = &frame.lines[y]; Ppu p;
     memcpy(&p, r->registers, PPU_SAVESTATE_REGS_SIZE);
     if ((p.inidisp & 128) || !(p.inidisp & 15) || (p.bgmode & 7) != 1) continue;
-    total += 64;
+    total += 64; ++lines;
+    /* 1.0.2: a backdrop layer blended through the subscreen (Launch
+     * Octopus' water) already costs both eyes a colour-math pass per
+     * pixel; BG1 depth on top of it can overrun the 3DS frame budget (his
+     * arena: 34 ms of 33). The 3DS loop withdraws it there while the
+     * composer runs late (MmxRendererAllowHeavyBg1Depth). */
+    const Ppu *q = &p;
+    if (PPU_addSubscreen(q) && PPU_mathEnabled(q) && (p.screenEnabled[1] & 7)) ++blended;
     if (!(p.screenEnabled[0] & 2)) continue;
     drawing_vram = frame.lines[vram_owner[y]].vram;
     for (int x = 2; x < 256; x += 4) {
@@ -1458,6 +1490,7 @@ static bool bg1_frame_depth(void) {
   }
   drawing_vram = saved;
   bool on = bg1_frame_state ? visible * 100 <= total * 3 : visible * 100 < total;
+  if (!bg1_heavy_allowed && blended * 4 >= lines) on = false;
   bg1_frame_state = total && on;
   /* Ease in/out over a few frames instead of popping at the threshold. */
   if (bg1_frame_state && bg1_frame_level < BG1_LEVELS) ++bg1_frame_level;
@@ -1545,7 +1578,7 @@ static void bg1_remap(const uint8_t *back, const uint16_t *row, int lo, int hi,
   }
 }
 static int frame_stereo_offset(MmxStereoEye eye, unsigned amount) {
-  if (stage_select_scene()) return MmxStereoBackgroundOffset(eye, amount);
+  if (stage_select_scene() || password_scene()) return MmxStereoBackgroundOffset(eye, amount);
   return MmxStereoStageOffset(eye, amount, frame.ram[0x1f7a]);
 }
 unsigned MmxRendererStereoDepthPixels(unsigned amount) {
@@ -2196,6 +2229,7 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
   bool stage = MmxWidePolicy_IsStageScene(frame.ram) && !menu;
   const bool select = !stage && !menu && stage_select_scene();
   const bool flat = !stage && !menu && !select && flat_native_scene();
+  const bool pass = flat && password_scene();
   bool rush_hud = stage && frame_rush.loaded;
   view_dx=view_dy=0;
   if(stage && peer_seat>=0 && frame_coop.initialized && MmxCoopViewsOnline()) {
@@ -2343,7 +2377,16 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
      * finished-frame shift would drag HUD/terrain and leave exposed holes.
      * Window masks stay at screen coordinates. Thunder Slimer uses BG2 as an
      * actor surface, so it cannot use the distant-background profile. */
-    int stereo_shift = (stage || select) && stereo_plane_allowed(&p) ? plane_offset : 0;
+    int stereo_shift = (stage || select || pass) && stereo_plane_allowed(&p) ? plane_offset : 0;
+    /* 1.0.2: password screen, as the native compositor. */
+    uint8_t pass_back[256];
+    const bool pass_line = pass && stereo_shift && password_depth_line(&p);
+    if (pass && !pass_line) stereo_shift = 0;
+    if (pass_line) {
+      uint16_t row[256];
+      for (int x = 0; x < 256; ++x) { int c = -1; row[x] = background(&p, r, 0, x, y + 1, false, &c); }
+      password_back(row, pass_back);
+    }
     unsigned stereo_layer = MmxRendererStereoLayer();
     /* Revision 16: select-screen portraits, as the native compositor. */
     const int select_bg1 = select && stereo_shift && bg1_select_depth_active(&p) ?
@@ -2648,6 +2691,12 @@ static bool draw_frame(uint32_t *out, MmxRenderView view, bool hud, int plane_of
           bg[0] = depth_row[src - depth_lo]; bg_colors[0] = depth_color[src - depth_lo];
           continue;
         }
+        if (pass_line && layer == 0 && (x < 0 || x >= 256 || pass_back[x])) continue;
+        if (pass_line && layer == 1) {
+          int mx = bx < 0 ? -bx - 1 : bx >= 256 ? 511 - bx : bx;
+          bg[1] = password_plane(background(&p, r, 0, mx, by, false, &bg_colors[1]));
+          continue;
+        }
         bg[layer] = background(&p, r, layer, bx, by, stage, &bg_colors[layer]);
       }
       if (palette_fade) {
@@ -2912,7 +2961,7 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
     /* draw_frame keeps a line flat under these conditions (its stereo plane
      * rule). When every line is flat both eyes are equal: draw once. */
     bool disparity = false;
-    if (amount && (stage || stage_select_scene()) && frame_stereo_offset(MMX_STEREO_LEFT, amount) &&
+    if (amount && (stage || stage_select_scene() || password_scene()) && frame_stereo_offset(MMX_STEREO_LEFT, amount) &&
         !(frame.ram[0x1f7a] == 6 && frame.ram[0x1e89] == 0x0c))
       for (unsigned y = 0; y < 224 && !disparity; ++y) {
         const uint8_t *regs = frame.lines[y].registers; Ppu q;
@@ -2929,7 +2978,8 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
   if (stage) prepare_stage_planes();
   const bool select = !stage && stage_select_scene();
   const bool flat = !stage && !select && flat_native_scene();
-  const int offset = flat ? 0 : frame_stereo_offset(MMX_STEREO_LEFT, amount);
+  const bool pass = flat && password_scene();
+  const int offset = flat && !pass ? 0 : frame_stereo_offset(MMX_STEREO_LEFT, amount);
   const unsigned stereo_layer = MmxRendererStereoLayer(), stereo_mask = 1u << stereo_layer;
   const unsigned flat_layer = stereo_layer ^ 1u;
   window_cache_valid = false;
@@ -2975,6 +3025,16 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
       if (enabled & (1u << layer)) native_bg_row(&p, layer, y + 1, bg[layer]);
     /* Same plane/actor/mosaic rule as the reference compositor. */
     int shift = stereo_plane_allowed(&p) ? offset : 0;
+    if (pass) {
+      if (shift > 0 && password_depth_line(&p)) {
+        uint8_t back[256];
+        uint16_t *b1 = bg[0] + NATIVE_MARGIN, *b2 = bg[1] + NATIVE_MARGIN;
+        password_back(b1, back);
+        for (int x = 0; x < 256; ++x) { b2[x] = password_plane(b1[x]); if (back[x]) b1[x] = 0; }
+        /* Columns 32-63 of this tilemap are empty: mirror the edges. */
+        for (int x = 1; x <= shift; ++x) { b2[-x] = b2[x - 1]; b2[255 + x] = b2[256 - x]; }
+      } else shift = 0;
+    }
     uint32_t fixed_lanes = MmxColourLanes(p.fixedColor);
     const bool plane_rows = (enabled & stereo_mask) != 0;
     if (!plane_rows) {
@@ -2995,7 +3055,7 @@ bool MmxRendererDrawStereoPair(uint32_t *left, uint32_t *right,
     /* Revision 16: BG1 scenery joins the per-eye scene plane. Samples stay
      * within the visible columns (an edge sample repeats, as for terrain). */
     uint16_t depth_l[256], depth_r[256];
-    bool depth1 = shift > 0 && (select ? bg1_select_depth_active(&p) : bg1_depth_active(&p, shift));
+    bool depth1 = shift > 0 && !pass && (select ? bg1_select_depth_active(&p) : bg1_depth_active(&p, shift));
     const bool merge = (p.screenEnabled[0] & 1) == ((p.screenEnabled[0] >> 1) & 1) &&
         (p.screenEnabled[1] & 1) == ((p.screenEnabled[1] >> 1) & 1);
     if (depth1 && select) {

@@ -49,3 +49,14 @@ bool Mmx3dsSaveState(const char *path, const uint16_t *thumb, char *error, size_
 bool Mmx3dsLoadState(const char *path, char *error, size_t capacity);
 bool Mmx3dsReadStateInfo(const char *path, Mmx3dsStateInfo *info);
 uint8_t Mmx3dsStage(void);
+/* 1.0.2: language of the core's error messages. */
+void Mmx3dsSetEnglish(bool on);
+/* 1.0.2: X's inventory, read between guest frames. valid: inside a stage. */
+typedef struct Mmx3dsStatus {
+  bool valid;
+  uint8_t hp, hp_max, lives, hearts, weapon; /* weapon: 0 buster, 1..8 */
+  uint8_t ammo[8]; bool owned[8];            /* menu order, ammo 0..28 */
+  uint8_t tank[4]; bool tank_owned[4];       /* 0..14 */
+  uint8_t upgrades;                          /* bits: helmet, arm, body, legs */
+} Mmx3dsStatus;
+bool Mmx3dsReadStatus(Mmx3dsStatus *status);

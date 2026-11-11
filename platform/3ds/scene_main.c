@@ -30,6 +30,7 @@ static void save(const char *path, const uint32_t *l, const uint32_t *r) {
 }
 typedef struct { unsigned frame; char op[8]; unsigned a, b; char s[16]; } Cmd;
 int main(int argc, char **argv) {
+  if (getenv("NO_HEAVY_BG1")) MmxRendererAllowHeavyBg1Depth(false); /* 1.0.2 */
   char e[512]; if (!Mmx3dsLoad(argv[1], e, sizeof e)) { fprintf(stderr, "%s\n", e); return 1; }
   FILE *sf = fopen(argv[2], "r"); const char *out = argv[3];
   static Cmd cmds[65536]; unsigned nc = 0; char line[256];
@@ -53,6 +54,13 @@ int main(int argc, char **argv) {
       else if (!strcmp(c->op, "shot")) shot = true;
       else if (!strcmp(c->op, "keep") && nkeep < 8) { keep_addr[nkeep] = (int)(c->a & 0x1ffff); keep_val[nkeep++] = (uint8_t)c->b; }
       else if (!strcmp(c->op, "unkeep")) nkeep = 0;
+      else if (!strcmp(c->op, "status")) {
+        Mmx3dsStatus st; Mmx3dsReadStatus(&st);
+        printf("status n=%u valid=%d hp=%u/%u lives=%u hearts=%u weapon=%u ammo", n, st.valid, st.hp, st.hp_max, st.lives, st.hearts, st.weapon);
+        for (int i = 0; i < 8; ++i) printf(" %c%u", st.owned[i] ? '+' : '-', st.ammo[i]);
+        printf(" tanks"); for (int i = 0; i < 4; ++i) printf(" %c%u", st.tank_owned[i] ? '+' : '-', st.tank[i]);
+        printf(" up=%x\n", st.upgrades);
+      }
       else if (!strcmp(c->op, "meta")) {
         /* Metatile map (BG1 world blocks under the camera) and candidate tables. */
         printf("ram b8c..ba4:"); for (unsigned a = 0xb8c; a < 0xba4; ++a) printf(" %02x", g_ram[a]); printf("\n");

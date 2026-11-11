@@ -10,8 +10,11 @@ enum { UI_SLOTS = 3, UI_DETAIL_LINES = 16, UI_LINE = 64 };
 
 typedef enum UiActionKind {
   UI_NONE, UI_SAVE, UI_LOAD, UI_DISPLAY, UI_FILTER, UI_PROFILE, UI_RESET,
-  UI_MUSIC_SOURCE, UI_MUSIC_VOL, UI_SFX_VOL /* revision 18; arg: 0/1, -1/+1 */
+  UI_MUSIC_SOURCE, UI_MUSIC_VOL, UI_SFX_VOL, /* revision 18; arg: 0/1, -1/+1 */
+  UI_LANGUAGE, UI_DASH, UI_STAGE_PANEL        /* 1.0.2 options; arg: 0/1 */
 } UiActionKind;
+/* 1.0.2: pages behind the tabs. The performance detail belongs to MENU. */
+typedef enum UiPageId { UI_PAGE_MENU, UI_PAGE_WEAPONS, UI_PAGE_OPTIONS } UiPageId;
 typedef struct UiAction { UiActionKind kind; int arg; } UiAction;
 
 typedef struct UiStats {
@@ -37,6 +40,16 @@ void UiSetDetail(const char lines[UI_DETAIL_LINES][UI_LINE]);
 bool UiDetailVisible(void);
 void UiToast(const char *text, bool ok, double now_ms);
 void UiSetNow(int64_t seconds); /* wall clock for "Hoy HH:MM" */
+/* 1.0.2 */
+void UiSetLanguage(bool english);
+bool UiEnglish(void);
+void UiSetPage(UiPageId page);
+UiPageId UiPage(void);
+/* Redraws only when something shown changed. */
+void UiSetStatus(const Mmx3dsStatus *status);
+/* dash_on_l: L dashes too and ZL/ZR change weapons; stage_weapons: show the
+ * weapons page when a stage starts. */
+void UiSetOptions(bool dash_on_l, bool stage_weapons);
 UiAction UiTouch(int x, int y, double now_ms);
 /* Redraws if anything changed; returns true when the canvas changed. */
 bool UiRender(double now_ms);
